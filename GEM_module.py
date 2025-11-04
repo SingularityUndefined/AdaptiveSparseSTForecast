@@ -52,16 +52,18 @@ class GraphLearningModule(nn.Module):
         return adj
 
 class GEM(nn.Module):
-    def __init__(self, num_nodes, mu, gamma, step_size, emb_dim=6, feature_dim=3, c=8, PGD_iters=100, scale=True):
+    def __init__(self, num_nodes, mu, gamma, step_size, emb_dim=6, feature_dim=3, c=8, PGD_iters=100, PGD_step_size=0.01, use_block_coordinate=False, scale=True):
         super(GEM, self).__init__()
         self.glm = GraphLearningModule(num_nodes, emb_dim, feature_dim, c)
         # self.S = torch.ones((num_nodes, num_nodes)) - torch.eye(num_nodes)  # all-one matrix with zero diagonal
         self.mu = mu
         self.c = c
         self.step_size = step_size
+        self.PGD_step_size = PGD_step_size
         self.gamma = gamma
         self.scale = scale
         self.PGD_iters = PGD_iters
+        self.use_block_coordinate = use_block_coordinate
     
     def scale_W(self, adj, S):
         W = adj * S
@@ -97,7 +99,7 @@ class GEM(nn.Module):
     def soft_thresholding(self, W, tau):
         return torch.sign(W) * torch.clamp(torch.abs(W) - tau, min=0.0)
 
-    def M_step_2(self, x, W0, S_init=None, block_coordinate=False):
+    def M_step_2(self, x, W0, S_init=None):
         # for fixed x, Sigma is fixed
         N = self.glm.num_nodes
         if S_init is None:
@@ -115,36 +117,42 @@ class GEM(nn.Module):
         R = torch.inverse(J + L)
         tilde_R = self.tilde_operation(R)
 
-        if block_coordinate:
+        if self.use_block_coordinate:
 
             for iter in range(self.PGD_iters):
+                S_new = S.clone()
                 for i in range(N):
-                    for j in range(i + 1, N): # iterate over all upper triangular entries
+                    for j in range(i+1, N): # iterate over all upper triangular entries
+                        # if i == j:
+                        #     continue
                         # PGD
                         # tilde_R_old = tilde_R_old.clone()
-                        S_new_ij = S[i, j] - self.step_size * (W0[i, j] * (tilde_R[i, j] - tilde_Sigma[i, j]))
-                        S_new_ij = self.soft_thresholding(S_new_ij, tau=self.step_size * self.gamma)
-                        S_new_ij = torch.clamp(S_new_ij, min=0.0, max=1.0)
-                        if iter % 10 == 0:
-                            print(f'BCPGD iter {iter+1}/{self.PGD_iters}, updating S[{i},{j}]: {S[i, j]:.4f} -> {S_new_ij:.4f}')
-                        delta_S_ij = S_new_ij - S[i, j]
-                        S[i, j] = S_new_ij
-                        S[j, i] = S_new_ij  # symmetric update
-
+                        S_old_ij = S_new[i, j]
+                        S_ij = S_new[i, j] - self.PGD_step_size * (W0[i, j] * (tilde_R[i, j] - tilde_Sigma[i, j]))
+                        S_ij = self.soft_thresholding(S_ij, tau=self.PGD_step_size * self.gamma)
+                        S_ij = torch.clamp(S_ij, min=0.0, max=1.0)
+                        delta_S_ij = S_ij - S_old_ij
+                        # OUT-OF-PLACE index update
+                        S_new = S_new.index_put((torch.tensor([i]), torch.tensor([j])), S_ij)
+                        S_new = S_new.index_put((torch.tensor([j]), torch.tensor([i])), S_ij)
                         # update tilde_R after each row update
                         if delta_S_ij != 0:
                             delta_r = tilde_R[i] - tilde_R[j]
                             tilde_Q = self.tilde_operation(torch.ger(delta_r, delta_r))  # (N, N)
                             tilde_R = tilde_R - (delta_S_ij / (1 - 2 * delta_S_ij * tilde_R[i, j])) * tilde_Q
+
+                if iter % 20 == 0:
+                    print(f'Block Coordinate PGD iter {iter+1}/{self.PGD_iters}, ||S_new - S||_F = {torch.norm(S_new - S):.4f}')
+                S = S_new
         else:
             for i in range(self.PGD_iters):
                 # update full tilde_R
                 # PGD
-                S_new = S - self.step_size * (W0 * (tilde_R - tilde_Sigma)) 
-                S_new = self.soft_thresholding(S_new, tau=self.step_size * self.gamma)
+                S_new = S - self.PGD_step_size * (W0 * (tilde_R - tilde_Sigma)) 
+                S_new = self.soft_thresholding(S_new, tau=self.PGD_step_size * self.gamma)
                 S_new = torch.clamp(S_new, min=0.0, max=1.0)
                 S_new.fill_diagonal_(0)
-                if i % 10 == 0:
+                if i % 20 == 0:
                     print(f'PGD iter {i+1}/{self.PGD_iters}, ||S_new - S||_F = {torch.norm(S_new - S):.4f}')
                 # update tilde_R
                 S = S_new
@@ -179,7 +187,7 @@ class GEM(nn.Module):
         print(f'after M-step-1: delta_W norm {torch.norm(W2 - W1):.4f}, GLR {GLR(x, L2):.4f}, adj norm^2 {adj2.norm()**2:.4f}')
 
         # M-step-2: optimizing alpha with gradient steps
-        S1 = self.M_step_2(x, adj2 * alpha2, block_coordinate=False)
+        S1 = self.M_step_2(x, adj2 * alpha2)
         print(S1)
         return x, adj2 * alpha2, S1, params
     
@@ -194,5 +202,8 @@ class GEM(nn.Module):
             x, adj, S, params = self.single_step(y, adj, S, params=params)
             W = adj * S
             print('W norm^2 at Iteration', it+1, W.norm()**2)
-            draw_graph_from_adj(W.detach().cpu(), title=f'Learned Graph at Iteration {it+1}')
+            threshold = 5e-3
+            W_plot = W.clone()
+            W_plot[W_plot < threshold] = 0.0
+            draw_graph_from_adj(W_plot.detach().cpu(), title=f'Learned Graph at Iteration {it+1}')
         return x, adj, S

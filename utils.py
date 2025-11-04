@@ -6,7 +6,7 @@ def draw_graph_from_adj(adj, title=None):
     G = nx.from_numpy_array(adj.numpy())
     pos = nx.circular_layout(G)
     nx.draw(G, pos, with_labels=True, node_color='lightblue', edge_color='gray')
-    edge_labels = {(u, v): f'{d["weight"]:.1f}' for (u, v, d) in G.edges(data=True)}
+    edge_labels = {(u, v): f'{d["weight"]:.2f}' for (u, v, d) in G.edges(data=True)}
     nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels)
     if title is not None:
         plt.title(title)
