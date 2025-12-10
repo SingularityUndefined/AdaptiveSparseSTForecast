@@ -28,8 +28,13 @@ def generate_graph_from_edges(num_nodes, edges, weights=None):
 def generate_y(num_nodes, sigma, L, n):
     # Convert L to tensor if it's not already
     L = torch.tensor(L, dtype=torch.float32)
-    
-    cov = sigma**2 * torch.eye(num_nodes) + torch.pinverse(L)
+    print(L, torch.pinverse(L))
+    J = torch.ones((num_nodes,num_nodes), device=L.device) / num_nodes
+    L_pinv = torch.linalg.inv(L + J) - J
+    print(L_pinv)
+
+    cov = sigma**2 * torch.eye(num_nodes) + L_pinv
+    print(cov)
     # For generating multivariate normal, we need to make sure covariance is symmetric
     cov = (cov + cov.t()) / 2
     

@@ -82,7 +82,9 @@ class GEM(nn.Module):
         return torch.linalg.solve(cov, y.t()).t()  # return in shape (B, N)
     
     def M_step_1(self, x, L):
-        loss = GLR(x, L)
+        N = self.glm.num_nodes
+        J = torch.ones((N, N), device=x.device) / N
+        loss = GLR(x, L) - torch.logdet(L + J)
         # backward to gradient descent
         grads = torch.autograd.grad(loss, self.glm.parameters(), create_graph=True)
         new_params = {}
