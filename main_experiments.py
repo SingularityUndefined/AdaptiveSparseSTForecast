@@ -1,4 +1,4 @@
-from GEM_module import GEM
+from GEM_module_compact import GEM
 from utils import *
 from scipy.sparse.csgraph import laplacian
 
