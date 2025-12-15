@@ -1,5 +1,5 @@
 from GEM_module_compact import GEM
-from utils import *
+from utils_compact import *
 from scipy.sparse.csgraph import laplacian
 
 # seed
