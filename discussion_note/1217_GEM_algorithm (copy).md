@@ -2,6 +2,8 @@
 
 ## 1 GEM Algorithm (Sparse Version)
 
+Notations: $\mathbf{S}=\frac{1}{N}\sum_{k=1}^{N}\mathbf{x}^{(k)}\mathbf{x}^{(k)T}$, learned graph weight matrix $\mathbf{W}^o$, adjacency mask $\mathbf{A}$, actual graph weight matrix $\mathbf{W}$, Laplacian matrix $\mathbf{L}$
+
 ### 0) Graph Learning Module
 
 - Learnable embeddings + 1-layer MLP (LeakyReLU activation)
@@ -13,7 +15,7 @@ $$
 \min_\mathbf{x} \Vert \mathbf{y}-\mathbf{x}\Vert_2^2+\mu\mathbf{x}^\top\mathbf{Lx}\quad \Rightarrow\quad \mathbf{x}=(\mathbf{I}+\mu\mathbf{L})^{-1}\mathbf{y}
 $$
 
-Solve with Conjugated gradients
+Solve by **CG**
 
 ### 2) M-step-1
 
@@ -26,7 +28,8 @@ $\text{tr}(\mathbf{SL})=\frac 1 N \sum_{i=1}^N\mathbf{x^{(i)}}^\top\mathbf{Lx}=\
 #### Challenge 1: Gradient Step
 
 $$
-\nabla_\theta\log\det(\mathbf{L}+\mathbf{J})|_{\theta=\theta_0} = [\mathbf{L}(\theta,\mathbf{A}) + \mathbf{J})^{-1}\nabla_{\theta}\mathbf{L}(\theta,\mathbf{A})]|_{\theta=\theta_0}=(\mathbf{L}(\theta_0,\mathbf{A}) + \mathbf{J})^{-1}\nabla_\theta\mathbf{L}(\theta,\mathbf{A}))|_{\theta=\theta_0}=\nabla_\theta\text{tr}((\mathbf{L}(\theta_0,\mathbf{A})+\mathbf{J})^{-1}\mathbf{L}(\theta, \mathbf{A}))|_{\theta=\theta_0}\\
+\nabla_\theta\log\det(\mathbf{L}+\mathbf{J})|_{\theta=\theta_0} = [\mathbf{L}(\theta,\mathbf{A}) + \mathbf{J})^{-1}\nabla_{\theta}\mathbf{L}(\theta,\mathbf{A})]|_{\theta=\theta_0}=(\mathbf{L}(\theta_0,\mathbf{A}) + \mathbf{J})^{-1}\nabla_\theta\mathbf{L}(\theta,\mathbf{A}))|_{\theta=\theta_0}\\
+=\nabla_\theta\text{tr}((\mathbf{L}(\theta_0,\mathbf{A})+\mathbf{J})^{-1}\mathbf{L}(\theta, \mathbf{A}))|_{\theta=\theta_0}\\
 \tilde{\mathcal{L}}(\theta) = \text{tr}(\mathbf{SL}(\theta)) - \text{tr}(\mathbf{R}_0\mathbf{L}(\theta)),\quad \mathbf{R}_0:=(\mathbf{L}(\theta_0)+\mathbf{J})^{-1}
 $$
 
@@ -46,44 +49,7 @@ Constraints: $\Vert \mathbf{L} \Vert_F = c$.
 
 Note that $\mathbf{L}$ is actually sparse, we only need the entries in $\mathbf{R}_0$ in the same position of $\mathbf{L}$: the **diagonals** and the **neighbors** defined by $\mathbf{A}$
 $$
-\text{tr}((\mathbf{S}-\mathbf{R}_0)\mathbf{L}) = \sum_{i=j\text{ or }A_{i,j}=1}(S_{i,j}-{R_{0}}_{i,j})L_{i,j},\quad\text{tr}(\mathbf{SL})=\frac{1}{N}\sum_{k=1}^{N}\mathbf{x}^{(k)\top}\mathbf{L}\mathbf{x}^{(k)}=\frac{1}{N}\sum_{k=1}^N \sum_{(i,j)\in\mathcal{E}}W_{ij}(x_i^{(k)}-x_j^{(k)})^2
-$$
-
-> ##### ~~Method 1: Neumann Series~~
->
-> ***1) Unshifted CGL*** Use *Neumann-Series* to compute $\mathbf{R}_0$: since $\Vert \mathbf{L} \Vert_F = c = \sqrt{\sum_i \lambda_i^2} > \lambda_{\text{max}}$. $\Vert \mathbf{L}+\mathbf{J}\Vert_F=\sqrt{1+\sum_{i\ge 2}\lambda_i^2}>\lambda_{\text{max}}$.
-> $$
-> \mathbf{R}_0 \approx \alpha \sum_{k=0}^{K} (\mathbf{I} -\alpha (\mathbf{L}+\mathbf{J}))^k,\quad 0<\alpha<\frac{2}{\lambda_{\text{max}}}
-> $$
-> let $\alpha = 2/c$, and set $K=5$ or $K=10$.
->
-> **Detailed implementation:** denote $\mathbf{M}=\mathbf{I}-\alpha(\mathbf{L}+\mathbf{J})$, $\mathbf{R}_0 = \mathbf{I} + \mathbf{M}(\mathbf{I} +\mathbf{M}(\mathbf{I}+\cdots))$
->
-> For any symmetric matrix $\mathbf{B}$,
-> $$
-> (\mathbf{MB})_{i,j}=\sum_k M_{i,k}B_{k,j}=B_{i,j} -\alpha \sum_k(L_{i,k} + \frac 1 n)B_{j,k}=B_{i,j}-\frac{\alpha}{n}\mathbf{1}^\top\mathbf{b}_j-\alpha\sum_{k\in\mathcal{N}_i}L_{i,k}B_{j,k}
-> $$
-> ***2) Shifted CGL Estimation (Dangerous)***
-> $$
-> \min_\theta \text{tr}(\mathbf{S}\mathbf{L}) - \log\det(\mathbf{L}+\epsilon\mathbf{I})+\gamma\Vert\mathbf{L}\Vert_{0,\text{off}},\quad \text{s.t. }\dots
-> $$
-> <font color=red>**Potential Danger:**</font> $\mathbf{L} = \mathbf{P} \text{diag}(0,\lambda_2,\dots, \lambda_n)\mathbf{P}^\top$, $(\mathbf{L}+\epsilon\mathbf{I})^{-1} = \mathbf{P}\text{diag}(\frac{1}{\epsilon},\frac{1}{\lambda_2+\epsilon},\dots ,\frac{1}{\lambda_n+\epsilon})\mathbf{P}^\top$, <font color=red>$1/\epsilon$ could be large.</font>
->
-> While $(\mathbf{L}+\mathbf{J})^{-1}=\mathbf{P} \text{diag}(1,\frac1 {\lambda_2},\dots, \frac 1{\lambda_n})\mathbf{P}^\top=\mathbf{L}^\dagger + \mathbf{J}$. Therefore, <font color=red>$\mathbf{L}^\dagger =\lim_{\epsilon\rightarrow 0} (\mathbf{L}+\epsilon\mathbf{I})^{-1} -\frac{1}{\epsilon} \mathbf{J}$</font>
->
-> Define $\mathbf{R}_0 = (\mathbf{L}+\epsilon\mathbf{I})^{-1}\approx \alpha\sum_{k=0}^K(\mathbf{I}-\alpha (\epsilon\mathbf{I}+\mathbf{L}))^k,\alpha\le \frac{1}{\epsilon+c}$.
->
-> Let $\alpha=\frac{1}{\epsilon+c}$, 
-> $$
-> \mathbf{R}_0 = \frac{1}{\epsilon+c}\sum_{k=0}^K \left(\frac{c}{\epsilon+c}\mathbf{I} - \frac{1}{\epsilon+c}\mathbf{L}\right)^k
-> $$
-> (Alternative: $(\mathbf{L}+\mathbf{J})^{-1}=\mathbf{L}^\dagger+\mathbf{J}=\lim_{\epsilon\rightarrow0^+}\alpha\sum_{k=0}^\infty(\mathbf{I}-\alpha (\epsilon\mathbf{I}+\mathbf{L}))^k$)
->
-> **Problem:** In both methods, the inverse has to be solved in the original form of $n\times n$. Sparse computation is not applicable.
-
-##### Method 2 Linear Equation Solver
-
-$$
+\text{tr}((\mathbf{S}-\mathbf{R}_0)\mathbf{L}) = \sum_{i=j\text{ or }A_{i,j}=1}(S_{i,j}-{R_{0}}_{i,j})L_{i,j},\quad\text{tr}(\mathbf{SL})=\frac{1}{N}\sum_{k=1}^{N}\mathbf{x}^{(k)\top}\mathbf{L}\mathbf{x}^{(k)}=\frac{1}{N}\sum_{k=1}^N \sum_{(i,j)\in\mathcal{E}}W_{ij}(x_i^{(k)}-x_j^{(k)})^2\\
 \text{tr}(\mathbf{R}_0\mathbf{L}) = \text{tr}\left(\mathbf{R}_0\sum_{(u,v)\in\mathcal{E}}W_{uv}(\mathbf{e}_u-\mathbf{e}_v)(\mathbf{e}_u-\mathbf{e}_v)^\top\right)=\sum_{(u,v)\in\mathcal{E}}W_{uv}(\mathbf{e}_u-\mathbf{e}_v)^\top \mathbf{R}_0(\mathbf{e}_u-\mathbf{e}_v)
 $$
 
@@ -95,11 +61,11 @@ Note that $\mathbf{R}_0$ **does not require gradients,** and so does $\mathbf{L}
 
 (1) $|\mathcal{E}|=k|\mathcal{V}|=nk$ could be large, conjugated gradients could be expensive. (2) The matrix is fixed for all edges to compute, and does not require gradient.
 
-**Solution 1**: Use *sparse Cholesky Decomposition* by `sksparse.cholmod.cholesky`  ($\mathbf{LDL}^\top$ for PSD matrices)
+**Method 1**: Use ***sparse Cholesky Decomposition*** by `sksparse.cholmod.cholesky`  ($\mathbf{LDL}^\top$ for PSD matrices)
 
 If PSD matrix decomposition is not supported: $\mathbf{z} = \mathbf{L}^\dagger(\mathbf{e}_u-\mathbf{e}_v)\approx [(\mathbf{L}+\epsilon\mathbf{I})^{-1} - \frac{1}{\epsilon n}\mathbf{11}^\top](\mathbf{e}_u-\mathbf{e}_v)=(\mathbf{L}+\epsilon\mathbf{I})^{-1}(\mathbf{e}_u-\mathbf{e}_v)$
 
-**Solution 2**: Solve $|\mathcal{E}|$ linear equations by CG.
+**Method 2**: Solve $|\mathcal{E}|$ linear equations by **CG**.
 
 #### *Update Formula*
 
@@ -141,7 +107,7 @@ $(\tilde{\mathbf{S}}\circ \mathbf{W}^o)_{ij}=w^o_{ij}(S_{ij}-\frac 1 2 S_{ii}-\f
 #### *Update Formula*
 
 $$
-A_{ij}^{\text{new}} = \Pi_{[0,1]}\left[S_{\eta\gamma}\left(A_{ij}-\eta W^o_{ij}\left(\frac{1}{N}\sum_{k=1}^{N}(x_i^{(k)}-x_j^{(k)})^2 -(\mathbf{e}_i-\mathbf{e}_j)^\top \mathbf{L}^{\dagger\text{new}}(\mathbf{e}_i-\mathbf{e}_j) \right)\right)\right]
+A_{ij}^{\text{new}} = \Pi_{[0,1]}\left[S_{\eta\gamma}\left(A_{ij}-\eta W^o_{ij}\left(\frac{1}{N}\sum_{k=1}^{N}(x_i^{(k)}-x_j^{(k)})^2 -(\mathbf{e}_i-\mathbf{e}_j)^\top \mathbf{L}^\dagger(\mathbf{e}_i-\mathbf{e}_j) \right)\right)\right]
 $$
 
 ### *Discussion*
@@ -151,16 +117,16 @@ $$
 
 ## 2 Complexity Analysis
 
-$n$ nodes, degree $k$
+$n$ nodes, degree $d$
 
-operation $\mathbf{x}\to\mathbf{Lx}$: $\mathcal{O}(nk)$
+operation $\mathbf{x}\to\mathbf{Lx}$: $\mathcal{O}(nd)$
 
-- E-step (unrolled CG): $\mathcal{O}(nkT)$ ($T$: unrolled CG iterations)
+- E-step (unrolled CG): $\mathcal{O}(ndT)$ ($T$: unrolled CG iterations)
 - M-step 1
-  - unrolled (block) CG: $\mathcal{O}(nk\cdot T\cdot nk)$ compute for $\frac{nk}2$ edges
-  - Sparse Cholesky Decomposition (2D grid): $\mathcal{O}(nk\log n)+\mathcal{O}(n^{1.5})+\mathcal{O}(nk\cdot nk)$ (symbolic factorization + Cholesky decompsition + solve $nk/2$ linear systems)
+  - unrolled (block) CG: $\mathcal{O}(nd\cdot T\cdot nd)$ compute for $\frac{nk}2$ edges
+  - Sparse Cholesky Decomposition (2D grid): $\mathcal{O}(nd\log n)+\mathcal{O}(n^{1.5})+\mathcal{O}(nd\cdot nd)$ (symbolic factorization + Cholesky decompsition + solve $nk/2$ linear systems)
 - M-step 2
-  - unrolled CG: $\mathcal{O}(Tn^2k^2)$
+  - unrolled CG: $\mathcal{O}(Tn^2d^2)$
 
 Question: Other simpler method to solve $w^o_{ij}(\mathbf{e}_i-\mathbf{e}_j)^\top \mathbf{L}^\dagger(\mathbf{e}_i-\mathbf{e}_j)$ for all $(i,j)\in\mathcal {E}$? In unrolled CG, we need to solve $|\mathcal{E}|$ linear equations at the same time.
 
