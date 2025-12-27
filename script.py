@@ -1,19 +1,23 @@
 import torch
-from scipy.sparse.linalg import cg, LinearOperator
+
+neighbor_list = torch.tensor([
+    [1, 2, 3],
+    [0, 2, 4],
+    [0, 1, 5],
+    [0, 4, 5],
+    [1, 3, 5],
+    [2, 3, 4]
+])  # example neighbor list for 6 nodes with 3 neighbors each   
 
 
-A = torch.eye(3)
-A[2,1]  = 0.5
-A[1,2]  = 0.5
-b = torch.randn(50,3)
-def func_A(x):
-    return torch.matmul(A, x.unsqueeze(-1)).squeeze(-1)
+adj = torch.randn((6, 3))  # example sparse adjacency matrix in (N, k) format
 
-A_op = LinearOperator((3,3), matvec=func_A)
+edge_indices = neighbor_list.view(-1)#  + (torch.arange(6).unsqueeze(1) * 6)
 
-print(func_A(b).shape)
+e = torch.eye(6)
 
-torch.linalg.solve(func_A, b)
-x, info = torch.sparse.linalg.cg(func_A, b, atol=1e-6, maxiter=100)
-print(x)
-print(info)
+edge_diffs = e.repeat_interleave(3, dim=0) - e[edge_indices.view(-1)]  
+
+print(edge_indices)  # print edge indices in (N, k) form
+
+print(edge_diffs.shape)  # print edge difference vectors
