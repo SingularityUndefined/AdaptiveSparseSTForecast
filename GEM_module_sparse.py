@@ -7,6 +7,8 @@ import math
 import scipy.sparse as sp
 import numpy as np
 from sparse_CG import *
+from utils_sparse import draw_graph
+from sparsemax import Sparsemax
 
 class GraphLearningModule(nn.Module):
     # generate weight matrix from node embeddings
@@ -15,17 +17,16 @@ class GraphLearningModule(nn.Module):
         self.num_nodes = num_nodes
         self.num_neighbors = num_neighbors
         self.neighbor_list = neighbor_list # in (N, k)
-        self.neighbor_mask = (neighbor_list >= 0)  # (N, k), original w mask
-        self.A_ori = self.neighbor_mask.float()
+        self.neighbor_mask = (neighbor_list != -1)  # (N, k), original w mask
         self.emb_dim = emb_dim
         self.feature_dim = feature_dim
 
         # embedding vectors
         self.node_embeddings = nn.Parameter(torch.randn(num_nodes, emb_dim))  
-        self.fc = nn.Linear(emb_dim, feature_dim)
+        self.fc = nn.Linear(emb_dim + 1, feature_dim)
         self.leakyrelu = nn.LeakyReLU(0.2)
         self.c = c
-        self.theta = theta
+        self.theta = nn.Parameter(torch.tensor(theta))
 
     def forward(self, x, params=None):
         """
@@ -36,15 +37,17 @@ class GraphLearningModule(nn.Module):
             node_embeddings = self.node_embeddings
             fc_weight = self.fc.weight
             fc_bias = self.fc.bias
+            theta = self.theta
         else:
             node_embeddings = params["node_embeddings"]
             fc_weight = params["fc.weight"]
             fc_bias = params["fc.bias"]
+            theta = params["theta"]
 
         B = x.size(0)
 
         # 1. embed each node (add)
-        e = x.unsqueeze(-1) + node_embeddings.unsqueeze(0)  # (B, N, emb_dim)
+        e = torch.cat([x.unsqueeze(-1), node_embeddings.unsqueeze(0).repeat(B, 1, 1)], dim=-1)  # (B, N, emb_dim + 1)
 
         # 2. Feature generation: linear + activation
         f = F.linear(e, fc_weight, fc_bias)   # (B, N, feature_dim)
@@ -54,14 +57,19 @@ class GraphLearningModule(nn.Module):
         df = f.unsqueeze(2) - f[:, self.neighbor_list.view(-1)].reshape(B, self.num_nodes, self.num_neighbors, self.feature_dim)  # (B, N, k, feature_dim)
 
         # 4. wacency by RBF kernel
-        w = torch.exp(-(df ** 2).sum(-1) / (2 * self.theta)).mean(0)  # (N, k)
+        w = torch.exp(-(df ** 2).sum(-1) / (2 * theta)).mean(0)  # (N, k)
+        if torch.isnan(w).any():
+            print('embedded x + e:', torch.isnan(e).any())
+            print('features f:', torch.isnan(f).any())
+            raise ValueError('NaN detected in w computation!')
 
         w = w * self.neighbor_mask.float()  # mask non-edges
+        assert torch.allclose(w * self.neighbor_mask.float(), w), "w has non-zero weights on non-edges!"
 
         return w # (N, k)
     
 class Generalized_EM(nn.Module):
-    def __init__(self, num_nodes, num_neighbors, neighbor_list, mu, gamma, step_size, emb_dim=6, feature_dim=3, c=8, theta=0.5, method='CG', CG_iters=10, PGD_iters=100, PGD_step_size=0.01, use_block_coordinate=False, scale=True):
+    def __init__(self, num_nodes, num_neighbors, neighbor_list, mu, gamma, step_size, emb_dim=6, feature_dim=3, c=8, theta=0.5, method='CG', inv_method='L+eI', CG_iters=10, PGD_iters=100, PGD_step_size=0.01, scale=True, GEM_iters=5):
         super(Generalized_EM, self).__init__()
         self.glm = GraphLearningModule(num_nodes, num_neighbors, neighbor_list, emb_dim, feature_dim, c, theta)
         self.neighbor_list = neighbor_list
@@ -81,13 +89,15 @@ class Generalized_EM(nn.Module):
         self.CG_iters = CG_iters
         self.PGD_iters = PGD_iters
 
-        # could be removed later
-        self.use_block_coordinate = use_block_coordinate
+        self.GEM_iters = GEM_iters  # could be removed later
+        self.inv_method = inv_method
+        assert inv_method in ['L+J', 'L+eI'], "Only 'L+J' and 'L+eI' are supported currently."
 
     def scale_w(self, w):
         '''
         scale to fit F-norm constraint of Laplacian (||L||_F = c)
         '''
+        assert torch.allclose(w * self.neighbor_mask.float(), w), "w has non-zero weights on non-edges!"
         degree = torch.sum(w, dim=1)  # (N,)
         scale_factor = 1
         if self.scale:
@@ -131,7 +141,7 @@ class Generalized_EM(nn.Module):
             return self.LHS_E_step(x, w)
 
         x, res_norms = batch_CG(A_func, y, tol=1e-6, max_iter=self.CG_iters)
-        print(len(res_norms),'E-step CG residual norms:', res_norms)
+        # print(len(res_norms),'E-step CG residual norms:', res_norms)
         return x  # return in shape (B, N)
     
     def _edge_diff_square(self, x):
@@ -150,6 +160,11 @@ class Generalized_EM(nn.Module):
         row_indices = torch.arange(N).unsqueeze(1).repeat(1, k).view(-1)  # (N*k,)
         col_indices = self.neighbor_list.view(-1)  # (N*k,)
         values = -w.view(-1)  # (N*k,)
+        # mask non-edges
+        col_mask = (col_indices != -1)
+        row_indices = row_indices[col_mask]
+        col_indices = col_indices[col_mask]
+        values = values[col_mask]
 
         # Diagonal entries
         diag_row_indices = torch.arange(N)
@@ -201,52 +216,52 @@ class Generalized_EM(nn.Module):
 
         if self.method == 'CG':
             def A_func(x):
-                return self.apply_L_plus_J(x, w)  # (num_edges, N)
-                # return self.apply_L_plus_epsilon_I(x, w, epsilon=4e-3)  # (num_edges, N)
+                if self.inv_method == 'L+J':
+                    return self.apply_L_plus_J(x, w)  # (num_edges, N)
+                elif self.inv_method == 'L+eI':
+                    return self.apply_L_plus_epsilon_I(x, w, epsilon=5e-3)  # (num_edges, N)
             
             def Minv_func(x):
-                return self.apply_inv_D_plus_J(x, w)  # (num_edges, N)
-                # return self.apply_inv_D(x, w)  # (num_edges, N)
+                if self.inv_method == 'L+J':
+                    return self.apply_inv_D_plus_J(x, w)  # (num_edges, N)
+                elif self.inv_method == 'L+eI':
+                    return self.apply_inv_D(x, w)  # (num_edges, N)
 
             assert CG_method in ['batch_CG', 'batch_PCG'], "Only 'batch_CG' and 'batch_PCG' are supported currently."
             if CG_method == 'batch_CG':
                 inv_ref, res_norms = batch_CG(A_func, e_input, tol=1e-6, max_iter=self.CG_iters)
             elif CG_method == 'batch_PCG':
                 inv_ref, res_norms = batch_PCG(A_func, e_input, Minv_func=Minv_func, tol=1e-6, max_iter=self.CG_iters)
-            print(len(res_norms),'r_tilde CG residual norms:', res_norms)
+            # print(len(res_norms),'r_tilde CG residual norms:', res_norms)
             # inv_ref = self.conjugated_gradients(A_func, e_input, tol=1e-6, max_iter=self.e_step_iters) # (N-1, N)
-            inv_ref = torch.concat([torch.zeros((1, N), device=w.device), inv_ref], dim=0)  # (N, N)
-            diag_inv_ref = torch.diagonal(inv_ref)  # (N,)
-
-            tilde_inv_ref = diag_inv_ref[:,None] + diag_inv_ref[None,:] - 2 * inv_ref  # (N, N), all (e_i - e_j)^T (L + J)^-1 (e_i - e_j) including non-edges
-            indices = torch.arange(N).unsqueeze(1).repeat(1, k).view(-1)  # (N*k,)
-            edge_indices = self.neighbor_list.view(-1)  # (num_edges,)
-            r_tilde = tilde_inv_ref[indices, edge_indices].reshape(N, k)  # (N, k)
-            r_tilde = r_tilde * self.neighbor_mask.float()  # mask non-edges
-            return r_tilde  # (N, k)
+            
 
         elif self.method == 'cholmod':
             pass  #TODO To be implemented: use cholmod to solve the system
-            detached_w = w.detach().cpu().numpy()
+            detached_w = w.detach().cpu()
             # in a sparse way
             sparse_L = self.sparse_L_from_w(detached_w)  # scipy sparse matrix
             # cholesky factorization
-            L_plus_J = sparse_L + sp.coo_matrix((np.ones(N), (np.arange(N), np.arange(N))), shape=(N, N))
-            factor = cholesky(L_plus_J) # use cholmod to do Cholesky factorization    
-            inv_ref = torch.zeros((N, N), device=w.device)
-            for i in range(1, N):
-                e_i = torch.zeros(N, device=w.device)
-                e_i[i] = 1.0
-                x_i = torch.tensor(factor.solve_A(e_i.cpu().numpy()), device=w.device)
-                inv_ref[i] = x_i
-            diag_inv_ref = torch.diagonal(inv_ref)  # (N,)  
-            tilde_inv_ref = diag_inv_ref[:,None] + diag_inv_ref[None,:] - 2 * inv_ref  # (N, N), all (e_i - e_j)^T (L + J)^-1 (e_i - e_j) including non-edges
-            edge_indices = self.neighbor_list.view(-1)  # (num_edges,)
-            r_tilde = tilde_inv_ref[torch.arange(N).unsqueeze(1), edge_indices.view(-1)].reshape(N, k)  # (N, k)
-            r_tilde = r_tilde * self.neighbor_mask.float()  # mask non-edges
+            L_plus_epsilon_I = sparse_L + sp.coo_matrix((np.ones(N) * 5e-3, (np.arange(N), np.arange(N))), shape=(N, N))
+            L_plus_epsilon_I = L_plus_epsilon_I.tocsc()
+            factor = cholesky(L_plus_epsilon_I) # use cholmod to do Cholesky factorization
+            # L_plus_J = sparse_L + sp.coo_matrix((np.ones(N), (np.arange(N), np.arange(N))), shape=(N, N))
+            # factor = cholesky(L_plus_J) # use cholmod to do Cholesky factorization    
+            inv_ref = torch.Tensor(factor(e_input.T.detach().cpu().numpy()).T)  # (N-1, N)
+            # inv_ref = torch.Tensor(factor.solve_A(e.detach().cpu().numpy()))  # (N-1, N)
 
 
-        return r_tilde  # (num_edges,)
+        inv_ref = torch.concat([torch.zeros((1, N), device=w.device), inv_ref], dim=0)  # (N, N)
+        diag_inv_ref = torch.diagonal(inv_ref)  # (N,)
+
+        tilde_inv_ref = diag_inv_ref[:,None] + diag_inv_ref[None,:] - inv_ref - inv_ref.T  # (N, N), all (e_i - e_j)^T (L + J)^-1 (e_i - e_j) including non-edges
+
+
+        indices = torch.arange(N).unsqueeze(1).repeat(1, k).view(-1)  # (N*k,)
+        edge_indices = self.neighbor_list.view(-1)  # (num_edges,)
+        r_tilde = tilde_inv_ref[indices, edge_indices].reshape(N, k)  # (N, k)
+        r_tilde = r_tilde * self.neighbor_mask.float()  # mask non-edges
+        return r_tilde  # (N, k)
     
     def GLR(self, x, w, method='edge_diff'):
         # x in shape (B, N), w in shape (N, k)
@@ -271,7 +286,7 @@ class Generalized_EM(nn.Module):
 
         proxy_loss = self.GLR(x, w) - (r_tilde * w).sum() / 2 # each edge counted twice
         # backward to gradient descent
-        grads = torch.autograd.grad(proxy_loss, self.glm.parameters(), create_graph=True)
+        grads = torch.autograd.grad(proxy_loss, self.glm.parameters(), retain_graph=True) #create_graph=True)
         new_params = {}
         for (name, param), grad in zip(self.glm.named_parameters(), grads):
             new_params[name] = param - self.step_size * grad
@@ -280,18 +295,18 @@ class Generalized_EM(nn.Module):
     def soft_thresholding(self, A, tau):
         return torch.sign(A) * torch.clamp(torch.abs(A) - tau, min=0.0)
     
-    def M_step_2(self, x, w_0, alpha, A_init=None):
+    def M_step_2(self, x, w_0, A_init=None):
         '''
         PGD step to update the wacency mask A
         ''' 
         # N = self.glm.num_nodes
         A = A_init if A_init is not None else self.neighbor_mask.float()
-
+        w, alpha = self.scale_w(w_0 * A)  # initial scaling
         # pre-fill the initial values
         w_0_alpha = w_0 * alpha
-        w = w_0_alpha * A  # (N, k)
         # not detached here, need gradient flow
         r_tilde = self._r_tilde(w)  # (N, k)
+        print('tr(RL)=', (r_tilde * w).sum().item() / 2)  # check validation, = n-1
         # for fixed x, edge_diffs is fixed
         edge_diff_squares = self._edge_diff_square(x)  # (N, k)
 
@@ -300,13 +315,22 @@ class Generalized_EM(nn.Module):
             A_old = A.clone()
             A_new = A_old - self.PGD_step_size * w_0_alpha * (edge_diff_squares - r_tilde)
             A_new = self.soft_thresholding(A_new, tau=self.PGD_step_size * self.gamma)
+            if torch.isnan(A_new).any():
+                print('w_0 has nan', torch.isnan(w_0).any())
+                print('A_old has nan', torch.isnan(A_old).any())
+                print('edge_diff_squares has nan', torch.isnan(edge_diff_squares).any())
+                print('r_tilde has nan', torch.isnan(r_tilde).any())
+                raise ValueError('NaN detected in A_new computation!')
+            assert torch.allclose(A_new * self.neighbor_mask.float(), A_new), "A_new has non-zero weights on non-edges!"
             A_new = torch.clamp(A_new, min=0.0, max=1.0) # project to [0, 1]
+            
             A_new = A_new * self.neighbor_mask.float()  # mask non-edges
 
             A = A_new
             # recompute graphs
             w = w_0_alpha * A  # (N, k)
             r_tilde = self._r_tilde(w)  # (N, k)
+            print(f'  PGD Iter {iter+1}/{self.PGD_iters}, tr(RL)=', (r_tilde * w).sum().item() / 2)  # check validation, = n-1
         
         return A
     
@@ -341,15 +365,15 @@ class Generalized_EM(nn.Module):
 
         # recompute wacency
         w_0 = self.glm(x, params=new_params)  # (N, k)
-        w, alpha = self.scale_w(w_0 * A) # rescale
+        assert torch.allclose(w_0 * self.neighbor_mask.float(), w_0), "w_0 has non-zero weights on non-edges!"
 
         # M step 2
-        A_new = self.M_step_2(x, w_0, alpha, A)
+        A_new = self.M_step_2(x, w_0, A)
 
 
         return x, w_0, A_new
     
-    def forward(self, y, w_init=None, A_init=None):
+    def forward(self, y, w_init=None, A_init=None, epochs=1):
     
         # init w and A
         w_0 = self.glm(y) if w_init is None else w_init
@@ -359,13 +383,36 @@ class Generalized_EM(nn.Module):
         w_plot = w.clone().detach().numpy()
         # w_plot[w_plot < 5e-3] = 0.0
         # TODO: init plot
+        draw_graph(self.neighbor_list, w, int(math.sqrt(self.num_nodes)), title='learned graph Iteration 0')
         
-        for it in range(self.m_step_iters):
-            print(f'Iteration {it+1}/{self.m_step_iters}')
+        for it in range(self.GEM_iters):
+            print(f'Iteration {it+1}/{self.GEM_iters}')
             x, w_0, A = self.single_step(y, w_0, A)
+            size_A = A.size()
             w, _ = self.scale_w(w_0 * A)
+
+            # A = Sparsemax(dim=-1)(A.view(1,-1)).view(size_A)  # project A by sparsemax
+            # A = Sparsemax(dim=1)(A)  # project A by sparsemax
+            # A_plot = A.clone().detach().numpy()
+            A_fill = A[self.neighbor_mask]
+
+            A_fill_sparsemax = Sparsemax(dim=1)(A_fill.view(1, -1))
+            
+            A_sparse = torch.zeros(size_A) 
+            A_sparse[self.neighbor_mask] = A_fill_sparsemax.view(-1)
+              # project A by sparsemax
+            # A = A_sparse.to(A.device)
+            sparse_W, _ = self.scale_w(w_0 * A_sparse)
+
             w_plot = w.clone().detach().numpy()
-            w_plot[w_plot < 5e-3] = 0.0
+            w_sparsemax = sparse_W.clone().detach().numpy()
+            if it % epochs == 0:
+                print('A statistics: min=', A[self.neighbor_mask].min().item(), ', max=', A[self.neighbor_mask].max().item(), ', mean=', A[self.neighbor_mask].mean().item())
+                print('w_0 statistics: min=', w_0[self.neighbor_mask].min().item(), ', max=', w_0[self.neighbor_mask].max().item(), ', mean=', w_0[self.neighbor_mask].mean().item())
+                print('w statistics: min=', w[self.neighbor_mask].min().item(), ', max=', w[self.neighbor_mask].max().item(), ', mean=', w[self.neighbor_mask].mean().item())
+                print(f'left edges: {(A[self.neighbor_mask] > 0).sum().item() // 2} / {self.neighbor_mask.sum().item() // 2}')
+                draw_graph(self.neighbor_list, w_plot, int(math.sqrt(self.num_nodes)), title=f'learned graph Iteration {it+1}')
+                draw_graph(self.neighbor_list, w_sparsemax, int(math.sqrt(self.num_nodes)), title=fr'Learned $\mathrm{{Sparsemax}}(A) \circ W$ at Iteration {it+1}')
             # TODO: print
 
         return x, w_0, A, w
