@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils_compact import draw_graph_from_adj, GLR
+from compact_version.utils_compact import draw_graph_from_adj, GLR
 import math
 # Graph Learning Module
 
