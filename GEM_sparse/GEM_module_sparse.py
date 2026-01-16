@@ -7,7 +7,7 @@ import math
 import scipy.sparse as sp
 import numpy as np
 from GEM_sparse.sparse_CG import *
-from utils_sparse import draw_graph
+from GEM_sparse.utils_sparse import draw_graph
 from sparsemax import Sparsemax
 
 class GraphLearningModule(nn.Module):
