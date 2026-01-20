@@ -6,8 +6,8 @@ from copy import deepcopy
 import math
 import scipy.sparse as sp
 import numpy as np
-from GEM_sparse.sparse_CG import *
-from GEM_sparse.utils_sparse import draw_graph
+from sparse_CG import *
+from utils_sparse import draw_graph
 from sparsemax import Sparsemax
 
 class GraphLearningModule(nn.Module):
@@ -371,9 +371,9 @@ class Generalized_EM(nn.Module):
         A_new = self.M_step_2(x, w_0, A)
 
 
-        return x, w_0, A_new
+        return x, w_0, A_new, new_params
     
-    def forward(self, y, w_init=None, A_init=None, epochs=1):
+    def forward(self, y, w_init=None, A_init=None, params=None, epochs=1):
     
         # init w and A
         w_0 = self.glm(y) if w_init is None else w_init
@@ -387,32 +387,33 @@ class Generalized_EM(nn.Module):
         
         for it in range(self.GEM_iters):
             print(f'Iteration {it+1}/{self.GEM_iters}')
-            x, w_0, A = self.single_step(y, w_0, A)
+            x, w_0, A, new_params = self.single_step(y, w_0, A, params=params)
             size_A = A.size()
             w, _ = self.scale_w(w_0 * A)
+            params = new_params
 
             # A = Sparsemax(dim=-1)(A.view(1,-1)).view(size_A)  # project A by sparsemax
             # A = Sparsemax(dim=1)(A)  # project A by sparsemax
             # A_plot = A.clone().detach().numpy()
-            A_fill = A[self.neighbor_mask]
+            # A_fill = A[self.neighbor_mask]
 
-            A_fill_sparsemax = Sparsemax(dim=1)(A_fill.view(1, -1))
+            # A_fill_sparsemax = Sparsemax(dim=1)(A_fill.view(1, -1))
             
-            A_sparse = torch.zeros(size_A) 
-            A_sparse[self.neighbor_mask] = A_fill_sparsemax.view(-1)
+            # A_sparse = torch.zeros(size_A) 
+            # A_sparse[self.neighbor_mask] = A_fill_sparsemax.view(-1)
               # project A by sparsemax
             # A = A_sparse.to(A.device)
-            sparse_W, _ = self.scale_w(w_0 * A_sparse)
+            # sparse_W, _ = self.scale_w(w_0 * A_sparse)
 
             w_plot = w.clone().detach().numpy()
-            w_sparsemax = sparse_W.clone().detach().numpy()
+            # w_sparsemax = sparse_W.clone().detach().numpy()
             if it % epochs == 0:
                 print('A statistics: min=', A[self.neighbor_mask].min().item(), ', max=', A[self.neighbor_mask].max().item(), ', mean=', A[self.neighbor_mask].mean().item())
                 print('w_0 statistics: min=', w_0[self.neighbor_mask].min().item(), ', max=', w_0[self.neighbor_mask].max().item(), ', mean=', w_0[self.neighbor_mask].mean().item())
                 print('w statistics: min=', w[self.neighbor_mask].min().item(), ', max=', w[self.neighbor_mask].max().item(), ', mean=', w[self.neighbor_mask].mean().item())
                 print(f'left edges: {(A[self.neighbor_mask] > 0).sum().item() // 2} / {self.neighbor_mask.sum().item() // 2}')
                 draw_graph(self.neighbor_list, w_plot, int(math.sqrt(self.num_nodes)), title=f'learned graph Iteration {it+1}')
-                draw_graph(self.neighbor_list, w_sparsemax, int(math.sqrt(self.num_nodes)), title=fr'Learned $\mathrm{{Sparsemax}}(A) \circ W$ at Iteration {it+1}')
+                # draw_graph(self.neighbor_list, w_sparsemax, int(math.sqrt(self.num_nodes)), title=fr'Learned $\mathrm{{Sparsemax}}(A) \circ W$ at Iteration {it+1}')
             # TODO: print
 
         return x, w_0, A, w
