@@ -3,6 +3,7 @@ import torch.nn as nn
 from model.unrolled_GEM import UnrolledGEM
 from dataloader.data_utils import *
 import time
+from tqdm import tqdm   
 
 # Generate graph and data
 n_row = 32
@@ -12,7 +13,7 @@ k = kernel ** 2 - 1
 feature_dim = 6
 num_nodes = n_row * n_row
 # signal generation
-y = generate_y_from_grid(n_row, sigma=0.4, n=512)
+x, y = generate_y_from_grid(n_row, sigma=0.4, n=512)
 
 # base graph generation
 nearest_neighbors = generate_kNN_from_grid(n_row, kernel, k)
@@ -35,7 +36,7 @@ model_param_dict = {
     'E_step_iters': 3,
     'inv_CG_iters': 4,
     'PGD_iters': 5,
-    'PGD_step_size': 0.1,
+    'PGD_step_size': 0.02,
     'M1_step_size': 0.02,
     'scale': True,
     'GEM_iters': 3,
@@ -51,50 +52,51 @@ print(f'Model total parameters: {total_params}')
 model.train()
 y = y.to(device)
 target = torch.zeros_like(y).to(device)
-batch_size = 8
+batch_size = 32
 num_batches = y.shape[0] // batch_size
 
 
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
 
 # device = torch.device("cuda")
 
 model = model.to(device)
 start_time = time.time()
-for i in range(10):
-    optimizer.zero_grad()
-    torch.cuda.reset_peak_memory_stats(device)
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize(device)  # 👈 必须
+for epochs in tqdm(range(5)):
+    for i in range(num_batches):
+        # optimizer.zero_grad()
+        # torch.cuda.reset_peak_memory_stats(device)
+        # torch.cuda.empty_cache()
+        # torch.cuda.synchronize(device)  # 👈 必须
 
-    y_batch = y[i*batch_size:(i+1)*batch_size].to(device)
+        y_batch = y[i*batch_size:(i+1)*batch_size].to(device)
 
-    # import torch.profiler
+        # import torch.profiler
 
-    # with torch.profiler.profile(
-    #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-    #     record_shapes=True,
-    #     profile_memory=True,
-    #     with_stack=True
-    # ) as prof:
-    #     output, _, _, _ = model(y_batch)
-    #     target = torch.zeros_like(output)
-    #     loss = nn.MSELoss()(output, target)
-    #     loss.backward()
-    #     optimizer.step()
+        # with torch.profiler.profile(
+        #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        #     record_shapes=True,
+        #     profile_memory=True,
+        #     with_stack=True
+        # ) as prof:
+        #     output, _, _, _ = model(y_batch)
+        #     target = torch.zeros_like(output)
+        #     loss = nn.MSELoss()(output, target)
+        #     loss.backward()
+        #     optimizer.step()
 
-    # print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
-    output, _, _, _ = model(y_batch)
-    target = torch.zeros_like(output)
-    loss = nn.MSELoss()(output, target)
-    loss.backward()
-    optimizer.step()
+        # print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
+        output, _, _, _ = model(y_batch)
+        target = x[i*batch_size:(i+1)*batch_size].to(device)
+        loss = nn.MSELoss()(output, target)
+        loss.backward()
+        optimizer.step()
 
 
-    torch.cuda.synchronize(device)  # 👈 必须
+        # torch.cuda.synchronize(device)  # 👈 必须
 
-    max_memory = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-    print(f"Batch {i+1}/{num_batches}, Max GPU memory allocated: {max_memory:.2f} MB")
+        # max_memory = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        # print(f"Batch {i+1}/{num_batches}, Max GPU memory allocated: {max_memory:.2f} MB")
 
 
 

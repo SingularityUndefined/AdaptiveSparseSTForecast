@@ -17,7 +17,7 @@ class GraphLearningModule(nn.Module):
         self.num_nodes = num_nodes
         self.num_neighbors = num_neighbors
         self.neighbor_list = neighbor_list # in (N, k)
-        self.neighbor_mask = (neighbor_list != -1)  # (N, k), original w mask
+        self.neighbor_mask = (neighbor_list != -1).to('cuda:1')  # (N, k), original w mask
         self.emb_dim = emb_dim
         self.feature_dim = feature_dim
 
@@ -62,9 +62,12 @@ class GraphLearningModule(nn.Module):
             print('embedded x + e:', torch.isnan(e).any())
             print('features f:', torch.isnan(f).any())
             raise ValueError('NaN detected in w computation!')
+        
+        assert torch.isnan(w).any() == False, "w has NaN values!"
 
         w = w * self.neighbor_mask.float()  # mask non-edges
-        assert torch.allclose(w * self.neighbor_mask.float(), w), "w has non-zero weights on non-edges!"
+        # assert torch.isnan(w).any() == False, "w has NaN values!"
+        assert torch.allclose(w * self.neighbor_mask.float(), w), f"w has non-zero weights on non-edges!, difference {(w * self.neighbor_mask.float() - w).abs().max().item()}"
 
         return w # (N, k)
     
@@ -127,9 +130,9 @@ class UnrolledGEM(nn.Module):
         self.GEM_iters = GEM_iters
 
         # TODO: define CG solvers
-        self.E_CG_solvers = nn.ModuleList([CG_solver(E_step_iters, alpha_init=0.1, beta_init=0.1) for _ in range(GEM_iters)])
-        self.M1_CG_solvers = nn.ModuleList([CG_solver(self.M1_CG_iters, alpha_init=0.1, beta_init=0.1) for _ in range(GEM_iters)])
-        self.M2_CG_solvers = nn.ModuleList([nn.ModuleList([CG_solver(self.M2_CG_iters, alpha_init=0.1, beta_init=0.1) for _ in range(PGD_iters)]) for _ in range(GEM_iters)])
+        self.E_CG_solvers = nn.ModuleList([CG_solver(E_step_iters, alpha_init=0.2, beta_init=0.2) for _ in range(GEM_iters)])
+        self.M1_CG_solvers = nn.ModuleList([CG_solver(self.M1_CG_iters, alpha_init=0.2, beta_init=0.2) for _ in range(GEM_iters)])
+        self.M2_CG_solvers = nn.ModuleList([nn.ModuleList([CG_solver(self.M2_CG_iters, alpha_init=0.2, beta_init=0.2) for _ in range(PGD_iters)]) for _ in range(GEM_iters)])
 
         self.mu = nn.Parameter(torch.ones((self.GEM_iters,)) * mu)  # learnable mu for E-step
         self.c = c # Here, C is the F-norm contraint, not squared
@@ -322,10 +325,12 @@ class UnrolledGEM(nn.Module):
         PGD step to update the wacency mask A
         ''' 
         # N = self.glm.num_nodes
+        assert torch.allclose(w_0 * self.neighbor_mask.float(), w_0), "w_0 has non-zero weights on non-edges!"
         A = A_init if A_init is not None else self.neighbor_mask.float()
         w, alpha = self.scale_w(w_0 * A)  # initial scaling
         # pre-fill the initial values
         w_0_alpha = w_0 * alpha
+        assert torch.allclose(w * self.neighbor_mask.float(), w), f"w has non-zero weights on non-edges!, difference {(w * self.neighbor_mask.float() - w).abs().max().item()}"
         # print('tr(RL)=', (r_tilde * w).sum().item() / 2)  # check validation, = n-1
         # for fixed x, edge_diffs is fixed
         edge_diff_squares = self._edge_diff_square(x)  # (N, k)
@@ -352,6 +357,7 @@ class UnrolledGEM(nn.Module):
             A = A_new
             # recompute graphs
             w = w_0_alpha * A  # (N, k)
+            assert torch.allclose(w * self.neighbor_mask.float(), w), "w has non-zero weights on non-edges!"
             # print(f'  PGD Iter {iter+1}/{self.PGD_iters}, tr(RL)=', (r_tilde * w).sum().item() / 2)  # check validation, = n-1
         
         return A
@@ -400,7 +406,7 @@ class UnrolledGEM(nn.Module):
     
         # init w and A
         w_0 = self.glm(y) if w_init is None else w_init
-        A = self.neighbor_mask.float() if A_init is None else A_init
+        A = self.neighbor_mask.float().clone().to(w_0.device) if A_init is None else A_init
         # rescale
         w, _ = self.scale_w(w_0 * A)
         # w_plot = w.clone().detach().numpy()
@@ -415,11 +421,11 @@ class UnrolledGEM(nn.Module):
             params = new_params
            
             # if it % epochs == 0:
-            #     print('A statistics: min=', A[self.neighbor_mask].min().item(), ', max=', A[self.neighbor_mask].max().item(), ', mean=', A[self.neighbor_mask].mean().item())
+            print('A statistics: min=', A[self.neighbor_mask].min().item(), ', max=', A[self.neighbor_mask].max().item(), ', mean=', A[self.neighbor_mask].mean().item())
             #     print('w_0 statistics: min=', w_0[self.neighbor_mask].min().item(), ', max=', w_0[self.neighbor_mask].max().item(), ', mean=', w_0[self.neighbor_mask].mean().item())
 
-        print('w statistics: min=', w[self.neighbor_mask].min().item(), ', max=', w[self.neighbor_mask].max().item(), ', mean=', w[self.neighbor_mask].mean().item())
-        print(f'left edges: {(A[self.neighbor_mask] > 0).sum().item() // 2} / {self.neighbor_mask.sum().item() // 2}')
+            print('w statistics: min=', w[self.neighbor_mask].min().item(), ', max=', w[self.neighbor_mask].max().item(), ', mean=', w[self.neighbor_mask].mean().item())
+            print(f'left edges: {(A[self.neighbor_mask] > 0).sum().item() // 2} / {self.neighbor_mask.sum().item() // 2}')
             # TODO: print
 
         return x, w_0, A, w

@@ -163,16 +163,24 @@ def generate_y_from_grid(n_row, sigma, n, edge_weights=0.6):
     J = torch.ones((num_nodes,num_nodes), device=L.device) / num_nodes
     L_pinv = torch.linalg.inv(L + J) - J
     # print(L_pinv)
+    L_pinv = (L_pinv + L_pinv.t()) / 2  # ensure symmetry
+
+    x = torch.distributions.MultivariateNormal(
+        loc=torch.zeros(num_nodes),
+        covariance_matrix=L_pinv
+    ).sample((n,))
+
+    y = x + torch.randn_like(x) * sigma
 
     cov = sigma**2 * torch.eye(num_nodes) + L_pinv
     cov = (cov + cov.t()) / 2
     
-    y = torch.distributions.MultivariateNormal(
-        loc=torch.zeros(num_nodes),
-        covariance_matrix=cov
-    ).sample((n,))
+    # y = torch.distributions.MultivariateNormal(
+    #     loc=torch.zeros(num_nodes),
+    #     covariance_matrix=cov
+    # ).sample((n,))
     
-    return y
+    return x, y
 
 
 # Example usage

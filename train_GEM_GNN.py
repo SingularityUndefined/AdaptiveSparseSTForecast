@@ -10,7 +10,7 @@ class DummyGraphDataset(torch.utils.data.Dataset):
         self.num_nodes = num_row * num_row
         self.sigma = sigma
         self.data_len = data_len
-        self.data = generate_y_from_grid(num_row, sigma, data_len)
+        _, self.data = generate_y_from_grid(num_row, sigma, data_len)
         # self.data = self.data.unsqueeze(0)  # (1, data_len, N)
 
     def __len__(self):
@@ -29,7 +29,7 @@ if __name__ == "__main__":
     hidden_dim = 16
     out_dim = 2
     lr = 1e-2
-    batch_size = 64
+    batch_size = 32
     max_epochs = 13
 
     # 数据
@@ -39,8 +39,8 @@ if __name__ == "__main__":
     # 模型
     model = GEM_GNN(
         num_nodes=32*32,
-        num_neighbors=24,
-        neighbor_list=generate_kNN_from_grid(32, kernel=5, k=24),
+        num_neighbors=48,
+        neighbor_list=generate_kNN_from_grid(32, kernel=7, k=48),
         mu=0.2,
         gamma=0.4,
         emb_dim=8,
@@ -49,8 +49,8 @@ if __name__ == "__main__":
         theta=0.5,
         method='CG',
         inv_method='L+J',
-        CG_iters=8,
-        PGD_iters=10,
+        CG_iters=5,
+        PGD_iters=8,
         PGD_step_size=0.01,
         scale=True,
         GEM_iters=5,
