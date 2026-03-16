@@ -129,6 +129,12 @@ def generate_grid_neigbhors(n_row):
         neighbor_list.append(neighbors)
     return torch.tensor(neighbor_list)
 
+def generate_grid_kNN_mask(n_row, kernel, k):
+    grid_neighbors = generate_grid_neigbhors(n_row)
+    neighbor_list = generate_kNN_from_grid(n_row, kernel, k)
+    mask = (neighbor_list != -1) & (neighbor_list.unsqueeze(2) == grid_neighbors.unsqueeze(1)).any(dim=2)
+    return mask
+
 def generate_y_from_grid(n_row, sigma, n, edge_weights=0.6):
     num_nodes = n_row * n_row
     neighbor_list = generate_grid_neigbhors(n_row)

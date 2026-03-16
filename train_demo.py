@@ -20,7 +20,7 @@ nearest_neighbors = generate_kNN_from_grid(n_row, kernel, k)
 neighbor_mask = nearest_neighbors != -1
 
 # Model initialization
-device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 model_param_dict = {
     'num_nodes': num_nodes,
     'num_neighbors': k,
@@ -29,17 +29,17 @@ model_param_dict = {
     'gamma': 0.4,
     'emb_dim': 8,
     'feature_dim': feature_dim,
-    'c': 16,
+    'c': 80,
     'theta': 0.5,
-    'method': 'CG',
+    'method': 'Hutchinson',
     'inv_method': 'L+J',
     'E_step_iters': 3,
-    'inv_CG_iters': 4,
-    'PGD_iters': 5,
-    'PGD_step_size': 0.02,
-    'M1_step_size': 0.02,
+    'inv_CG_iters': 3,
+    'PGD_iters': 8,
+    'PGD_step_size': 0.1,
+    'M1_step_size': 0.01,
     'scale': True,
-    'GEM_iters': 3,
+    'GEM_iters': 4,
     'full_unrolling': True
 }
 
@@ -56,18 +56,18 @@ batch_size = 32
 num_batches = y.shape[0] // batch_size
 
 
-optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
+optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
 
 # device = torch.device("cuda")
 
 model = model.to(device)
 start_time = time.time()
-for epochs in tqdm(range(5)):
-    for i in range(num_batches):
-        # optimizer.zero_grad()
-        # torch.cuda.reset_peak_memory_stats(device)
-        # torch.cuda.empty_cache()
-        # torch.cuda.synchronize(device)  # 👈 必须
+for epochs in tqdm(range(1)):
+    for i in range(10):  # only run 10 batches for demo
+        optimizer.zero_grad()
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(device)  # 👈 必须
 
         y_batch = y[i*batch_size:(i+1)*batch_size].to(device)
 
@@ -93,10 +93,10 @@ for epochs in tqdm(range(5)):
         optimizer.step()
 
 
-        # torch.cuda.synchronize(device)  # 👈 必须
+        torch.cuda.synchronize(device)  # 👈 必须
 
-        # max_memory = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-        # print(f"Batch {i+1}/{num_batches}, Max GPU memory allocated: {max_memory:.2f} MB")
+        max_memory = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        print(f"Batch {i+1}/{num_batches}, Max GPU memory allocated: {max_memory:.2f} MB")
 
 
 

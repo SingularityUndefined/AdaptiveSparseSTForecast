@@ -5,6 +5,9 @@ from torch.utils.data import DataLoader
 from model.GNN_GEM_lightning import GEM_GNN
 import lightning as L
 
+L.seed_everything(42)
+torch.manual_seed(42)
+
 class DummyGraphDataset(torch.utils.data.Dataset):
     def __init__(self, num_row, data_len, sigma=0.4):
         self.num_nodes = num_row * num_row
@@ -29,8 +32,11 @@ if __name__ == "__main__":
     hidden_dim = 16
     out_dim = 2
     lr = 1e-2
-    batch_size = 32
-    max_epochs = 13
+    batch_size = 64
+    max_epochs = 20
+
+    kernel = 7
+    # knn = kernel ** 2 - 1
 
     # 数据
     dataset = DummyGraphDataset(num_row=32, data_len=512, sigma=0.4)
@@ -39,8 +45,8 @@ if __name__ == "__main__":
     # 模型
     model = GEM_GNN(
         num_nodes=32*32,
-        num_neighbors=48,
-        neighbor_list=generate_kNN_from_grid(32, kernel=7, k=48),
+        num_neighbors=kernel**2 - 1,
+        neighbor_list=generate_kNN_from_grid(32, kernel=kernel, k=kernel**2 - 1),
         mu=0.2,
         gamma=0.4,
         emb_dim=8,

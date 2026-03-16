@@ -39,6 +39,7 @@ class GraphLearningModule(nn.Module):
             fc_bias = self.fc.bias
             theta = self.theta
         else:
+            # print(list(params.keys()))
             node_embeddings = params["node_embeddings"]
             fc_weight = params["fc.weight"]
             fc_bias = params["fc.bias"]
@@ -69,7 +70,7 @@ class GraphLearningModule(nn.Module):
         return w # (N, k)
     
 class Generalized_EM(nn.Module):
-    def __init__(self, num_nodes, num_neighbors, neighbor_list, mu, gamma, step_size, emb_dim=6, feature_dim=3, c=8, theta=0.5, method='CG', inv_method='L+eI', CG_iters=10, PGD_iters=100, PGD_step_size=0.01, scale=True, GEM_iters=5):
+    def __init__(self, num_nodes, num_neighbors, neighbor_list, mu, gamma, step_size, emb_dim=6, feature_dim=3, c=8, theta=0.5, method='CG', inv_method='L+eI', use_proxy_loss=True, CG_iters=10, PGD_iters=100, PGD_step_size=0.01, scale=True, GEM_iters=5, epsilon=0.2, M1_iters=5, update_theta=True):
         super(Generalized_EM, self).__init__()
         self.glm = GraphLearningModule(num_nodes, num_neighbors, neighbor_list, emb_dim, feature_dim, c, theta)
         self.neighbor_list = neighbor_list
@@ -85,14 +86,16 @@ class Generalized_EM(nn.Module):
         self.gamma = gamma
         self.scale = scale
         self.method = method
-        assert method in ['CG', 'cholmod'], "Only 'CG' and 'cholmod' are supported currently."
+        assert method in ['CG', 'cholmod', 'Hutchinson'], "Only 'CG' and 'cholmod' are supported currently."
         self.CG_iters = CG_iters
         self.PGD_iters = PGD_iters
-
+        self.use_proxy_loss = use_proxy_loss
         self.GEM_iters = GEM_iters  # could be removed later
         self.inv_method = inv_method
         assert inv_method in ['L+J', 'L+eI'], "Only 'L+J' and 'L+eI' are supported currently."
-
+        self.epsilon = epsilon
+        self.M1_iters = M1_iters
+        self.update_theta = update_theta
     def scale_w(self, w):
         '''
         scale to fit F-norm constraint of Laplacian (||L||_F = c)
@@ -124,10 +127,10 @@ class Generalized_EM(nn.Module):
         Lx = self.apply_L(X, w)  # (B, N)
         return Lx + Jx
     
-    def apply_L_plus_epsilon_I(self, X, w, epsilon=4e-3):
+    def apply_L_plus_epsilon_I(self, X, w):
         # w in (N, k), X in (B, N)
         Lx = self.apply_L(X, w)  # (B, N)
-        return Lx + epsilon * X
+        return Lx + self.epsilon * X
         
     def LHS_E_step(self, x, w):
         # solve equation (I + mu*L)X = Y
@@ -219,7 +222,7 @@ class Generalized_EM(nn.Module):
                 if self.inv_method == 'L+J':
                     return self.apply_L_plus_J(x, w)  # (num_edges, N)
                 elif self.inv_method == 'L+eI':
-                    return self.apply_L_plus_epsilon_I(x, w, epsilon=5e-3)  # (num_edges, N)
+                    return self.apply_L_plus_epsilon_I(x, w)  # (num_edges, N)
             
             def Minv_func(x):
                 if self.inv_method == 'L+J':
@@ -234,6 +237,7 @@ class Generalized_EM(nn.Module):
                 inv_ref, res_norms = batch_PCG(A_func, e_input, Minv_func=Minv_func, tol=1e-6, max_iter=self.CG_iters)
             # print(len(res_norms),'r_tilde CG residual norms:', res_norms)
             # inv_ref = self.conjugated_gradients(A_func, e_input, tol=1e-6, max_iter=self.e_step_iters) # (N-1, N)
+            inv_ref = torch.concat([torch.zeros((1, N), device=w.device), inv_ref], dim=0)
             
 
         elif self.method == 'cholmod':
@@ -242,16 +246,41 @@ class Generalized_EM(nn.Module):
             # in a sparse way
             sparse_L = self.sparse_L_from_w(detached_w)  # scipy sparse matrix
             # cholesky factorization
-            L_plus_epsilon_I = sparse_L + sp.coo_matrix((np.ones(N) * 5e-3, (np.arange(N), np.arange(N))), shape=(N, N))
+            L_plus_epsilon_I = sparse_L + sp.coo_matrix((np.ones(N) * self.epsilon, (np.arange(N), np.arange(N))), shape=(N, N))
             L_plus_epsilon_I = L_plus_epsilon_I.tocsc()
             factor = cholesky(L_plus_epsilon_I) # use cholmod to do Cholesky factorization
             # L_plus_J = sparse_L + sp.coo_matrix((np.ones(N), (np.arange(N), np.arange(N))), shape=(N, N))
             # factor = cholesky(L_plus_J) # use cholmod to do Cholesky factorization    
             inv_ref = torch.Tensor(factor(e_input.T.detach().cpu().numpy()).T)  # (N-1, N)
             # inv_ref = torch.Tensor(factor.solve_A(e.detach().cpu().numpy()))  # (N-1, N)
+            inv_ref = torch.concat([torch.zeros((1, N), device=w.device), inv_ref], dim=0)
+        
+        elif self.method == 'Hutchinson':
+            # generate random vectors
+            print('Hutchinson estimator for r_tilde')
+            num_probes = 20
+            z = torch.randint(0, 2, (num_probes, N), device=w.device).float() * 2 - 1  # Rademacher vectors, (N, num_probes)
+            def A_func(x):
+                if self.inv_method == 'L+J':
+                    return self.apply_L_plus_J(x, w)  # (num_edges, N)
+                elif self.inv_method == 'L+eI':
+                    return self.apply_L_plus_epsilon_I(x, w)  # (num_edges, N)
+            
+            def Minv_func(x):
+                if self.inv_method == 'L+J':
+                    return self.apply_inv_D_plus_J(x, w)  # (num_edges, N)
+                elif self.inv_method == 'L+eI':
+                    return self.apply_inv_D(x, w)  # (num_edges, N)
 
-
-        inv_ref = torch.concat([torch.zeros((1, N), device=w.device), inv_ref], dim=0)  # (N, N)
+            assert CG_method in ['batch_CG', 'batch_PCG'], "Only 'batch_CG' and 'batch_PCG' are supported currently."
+            if CG_method == 'batch_CG':
+                Ainv_z, res_norms = batch_CG(A_func, z, tol=1e-6, max_iter=self.CG_iters)
+            elif CG_method == 'batch_PCG':
+                Ainv_z, res_norms = batch_PCG(A_func, z, Minv_func=Minv_func, tol=1e-6, max_iter=self.CG_iters) # in (num_probes, N)
+            
+            inv_ref = Ainv_z.T @ z / num_probes  # (N, N)
+    
+          # (N, N)
         diag_inv_ref = torch.diagonal(inv_ref)  # (N,)
 
         tilde_inv_ref = diag_inv_ref[:,None] + diag_inv_ref[None,:] - inv_ref - inv_ref.T  # (N, N), all (e_i - e_j)^T (L + J)^-1 (e_i - e_j) including non-edges
@@ -262,6 +291,31 @@ class Generalized_EM(nn.Module):
         r_tilde = tilde_inv_ref[indices, edge_indices].reshape(N, k)  # (N, k)
         r_tilde = r_tilde * self.neighbor_mask.float()  # mask non-edges
         return r_tilde  # (N, k)
+    
+    def slq_logdet(self, w, num_probes=30, cg_iters=50):
+        '''
+        Stochastic Lanczos Quadrature to estimate logdet(L + J) or logdet(L + eI)
+        w in (N, k)
+        '''
+        N = w.size(0)
+        logdets = []
+        for probe in range(num_probes):
+            v = torch.randint(0, 2, (N, ), device=w.device).float() * 2 - 1  # Rademacher vector
+            def A_func(x):
+                if self.inv_method == 'L+J':
+                    return self.apply_L_plus_J(x.unsqueeze(0), w).squeeze(0)  # (N,)
+                elif self.inv_method == 'L+eI':
+                    return self.apply_L_plus_epsilon_I(x.unsqueeze(0), w).squeeze(0)  # (N,)
+            # alphas, betas = lanczos_tridiag(A_func, v, cg_iters)
+            # T = torch.diag(alphas) + torch.diag(betas[:-1], 1) + torch.diag(betas[:-1], -1)  # tridiagonal matrix
+            T, _ = Lanczos(A_func, v, cg_iters)# .tridiagonal_matrix()  # tridiagonal matrix
+            evals, evecs = torch.linalg.eigh(T)
+            weights = evecs[0, :] ** 2  # first component squared
+            logdet_estimate = torch.sum(weights * torch.log(evals)) * N  # scale by N
+            # eigvals = torch.linalg.eigvalsh(T)  # eigenvalues of T
+            # logdet_estimate = torch.sum(torch.log(eigvals))  # logdet of T
+            logdets.append(logdet_estimate.item())
+        return sum(logdets) / num_probes  # average logdet estimate
     
     def GLR(self, x, w, method='edge_diff'):
         # x in shape (B, N), w in shape (N, k)
@@ -275,22 +329,60 @@ class Generalized_EM(nn.Module):
             return GLR_value  # mean over batch
 
     
+    def M_step_1_w_only(self, x, w, A):
+        # update W only on MM
+        # Lipschitz constant
+        N = self.num_nodes
+        Lw = (math.sqrt(N)+1) ** 2 / self.epsilon ** 2   # (1/mu * ||L||_2 + epsilon)^2
+        print('Lipschitz constant for w:', Lw)
+        # N = self.num_nodes
+        for i in range(self.M1_iters):
+            detached_w = w.clone().detach()
+            r_tilde = self._r_tilde(detached_w)  # (N, k)
+            w_update = w - (self._edge_diff_square(x) - r_tilde) / Lw
+            inv_A = torch.where(A > 0, 1.0 / A, torch.zeros_like(A))  # inverse of A with zero handling
+            w_0 = w_update * inv_A
+            w = w_0 * A  # apply mask
+
+        return w_0
+    
+
+    def M_step_1_proxy_loss(self, x, w):
+        N = self.num_nodes
+        detached_w = w.clone().detach()
+        # print(w.requires_grad)
+        
+        if self.use_proxy_loss:
+            r_tilde = self._r_tilde(detached_w)  # (N, k)
+            print('tr(RL)=', (r_tilde * detached_w).sum().item() / 2) # check validation, = n-1
+            print('use proxy loss')
+            proxy_loss = self.GLR(x, w) - (r_tilde * w).sum() / 2 # each edge counted twice
+            if self.inv_method == 'L+eI':
+                # Lipschitz constant
+                Lw = (math.sqrt(N)+1) ** 2 / self.epsilon ** 2   # (1/mu * ||L||_2 + epsilon)^2
+                print('Lipschitz constant for w:', Lw)
+                proxy_loss = proxy_loss + Lw / 2 * torch.sum((w - detached_w) ** 2)  # add L2 regularization on w to stabilize training
+        else: #slq
+            print('slq logdet')
+            logdet = self.slq_logdet(w, num_probes=20, cg_iters=20)
+            print(logdet)
+            print('logdet(L+J or L+eI)=', logdet)
+            proxy_loss = self.GLR(x, w) - logdet
+        # backward to gradient descent
+
+        return proxy_loss
+
     def M_step_1(self, x, w):
         '''
         backward the proxy loss trace(X^T L X)/B - tr(R L) = sum_ij W_ij * ((x_i - x_j)^2/B - r_tilde_ij)
-        '''
-        N = self.num_nodes
-        detached_w = w.clone().detach()
-        r_tilde = self._r_tilde(detached_w)  # (N, k)
-        print('tr(RL)=', (r_tilde * detached_w).sum().item() / 2) # check validation, = n-1
-
-        proxy_loss = self.GLR(x, w) - (r_tilde * w).sum() / 2 # each edge counted twice
-        # backward to gradient descent
+        '''       
+        proxy_loss = self.M_step_1_proxy_loss(x, w)
+       
         grads = torch.autograd.grad(proxy_loss, self.glm.parameters(), retain_graph=True) #create_graph=True)
         new_params = {}
         for (name, param), grad in zip(self.glm.named_parameters(), grads):
             new_params[name] = param - self.step_size * grad
-        return new_params
+        return new_params# self.glm.parameters() # new_params
     
     def soft_thresholding(self, A, tau):
         return torch.sign(A) * torch.clamp(torch.abs(A) - tau, min=0.0)
@@ -305,6 +397,9 @@ class Generalized_EM(nn.Module):
         # pre-fill the initial values
         w_0_alpha = w_0 * alpha
         # not detached here, need gradient flow
+        assert torch.isnan(w).any() == False, "w has NaN values!"
+        assert torch.all(w >= 0.0), "w has negative values!"
+        print('w', w)
         r_tilde = self._r_tilde(w)  # (N, k)
         print('tr(RL)=', (r_tilde * w).sum().item() / 2)  # check validation, = n-1
         # for fixed x, edge_diffs is fixed
@@ -356,16 +451,22 @@ class Generalized_EM(nn.Module):
         # update weight matrix 
         w_0 = self.glm(x, params=params)
         w, _ = self.scale_w(w_0 * A) # rescale
+        
 
-        # M step 1
-        new_params = self.M_step_1(x, w)
-        # update glm parameters
-        # for name, param in self.glm.named_parameters():
-        #     param.data = new_params[name].data
+        if self.update_theta:
+            # M step 1
+            new_params = self.M_step_1(x, w)
+            # update glm parameters
+            # for name, param in self.glm.named_parameters():
+            #     param.data = new_params[name].data
 
-        # recompute wacency
-        w_0 = self.glm(x, params=new_params)  # (N, k)
-        assert torch.allclose(w_0 * self.neighbor_mask.float(), w_0), "w_0 has non-zero weights on non-edges!"
+            # recompute wacency
+            w_0 = self.glm(x, params=new_params)  # (N, k)
+            assert torch.allclose(w_0 * self.neighbor_mask.float(), w_0), "w_0 has non-zero weights on non-edges!"
+        else:
+            w = self.M_step_1_w_only(x, w, A)  # update w only on MM
+            new_params = None
+
 
         # M step 2
         A_new = self.M_step_2(x, w_0, A)
@@ -373,13 +474,17 @@ class Generalized_EM(nn.Module):
 
         return x, w_0, A_new, new_params
     
-    def forward(self, y, w_init=None, A_init=None, params=None, epochs=1):
+    def forward(self, y, w_init=None, A_init=None, params=None, epochs=1, w_GT=None):
     
         # init w and A
         w_0 = self.glm(y) if w_init is None else w_init
         A = self.neighbor_mask.float() if A_init is None else A_init
         # rescale
         w, _ = self.scale_w(w_0 * A)
+        # if w_GT is not None:
+            # print('w_GT')
+        # assert w_GT is not None, "w_GT is required for metric computation!"
+        
         w_plot = w.clone().detach().numpy()
         # w_plot[w_plot < 5e-3] = 0.0
         # TODO: init plot
@@ -413,6 +518,9 @@ class Generalized_EM(nn.Module):
                 print('w statistics: min=', w[self.neighbor_mask].min().item(), ', max=', w[self.neighbor_mask].max().item(), ', mean=', w[self.neighbor_mask].mean().item())
                 print(f'left edges: {(A[self.neighbor_mask] > 0).sum().item() // 2} / {self.neighbor_mask.sum().item() // 2}')
                 draw_graph(self.neighbor_list, w_plot, int(math.sqrt(self.num_nodes)), title=f'learned graph Iteration {it+1}')
+
+                metric = (w - w_GT).norm().item() / w_GT.norm().item()
+                print('|W - W_GT|/|W_GT|:', metric)
                 # draw_graph(self.neighbor_list, w_sparsemax, int(math.sqrt(self.num_nodes)), title=fr'Learned $\mathrm{{Sparsemax}}(A) \circ W$ at Iteration {it+1}')
             # TODO: print
 

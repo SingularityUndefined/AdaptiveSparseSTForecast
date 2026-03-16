@@ -90,7 +90,6 @@ def batch_CG(A_func, B_vecs, X0=None, tol=1e-6, max_iter=None):
 
     return X, res_norms
 
-import torch
 
 def block_cg_func(A_func, B_vecs, X0=None, tol=1e-6, max_iter=None):
     """
@@ -254,3 +253,175 @@ def batch_PCG(A_func, B_vecs, x0=None, Minv_func=None, max_iter=50, tol=1e-6):
         RZ_old = RZ_new
     
     return X, residuals
+
+def Lanczos(A_func, b, m):
+    """
+    Lanczos algorithm to approximate eigenvalues and eigenvectors of A.
+    
+    Parameters
+    ----------
+    A_func : function
+        Function that computes A @ x for given x.
+    b : torch.Tensor, shape (N,)
+        Initial vector.
+    m : int
+        Number of Lanczos iterations.  
+    Returns
+    -------
+    T : torch.Tensor, shape (m, m)
+        Tridiagonal matrix.
+    Q : torch.Tensor, shape (N, m)
+        Orthonormal basis vectors.
+    """
+    N = b.shape[0]
+    Q = torch.zeros((N, m), dtype=b.dtype, device=b.device)
+    alpha = torch.zeros(m, dtype=b.dtype, device=b.device)
+    beta = torch.zeros(m-1, dtype=b.dtype, device=b.device)
+
+    q = b / torch.norm(b)
+    Q[:, 0] = q
+
+    for j in range(m):
+        z = A_func(Q[:, j])
+        alpha[j] = torch.dot(Q[:, j], z)
+        z = z - alpha[j] * Q[:, j]
+        if j > 0:
+            z = z - beta[j-1] * Q[:, j-1]
+        if j < m - 1:
+            beta[j] = torch.norm(z)
+            if beta[j] > 1e-12:
+                Q[:, j+1] = z / beta[j]
+            else:
+                break
+
+    T = torch.diag(alpha) + torch.diag(beta, 1) + torch.diag(beta, -1)
+    return T, Q
+
+
+
+
+def orthonormalize(X):
+    # QR orthogonalization
+    Q, _ = torch.linalg.qr(X)
+    return Q
+
+
+def LOBPCG(
+    A_func,
+    X0,
+    M_inv_func=None,
+    max_iter=100,
+    tol=1e-8,
+    largest=False,
+):
+    """
+    LOBPCG solver for symmetric eigenvalue problems A x = λ x
+
+    Parameters
+    ----------
+    A_func : callable
+        Function computing A @ X
+    X0 : (n, k) tensor
+        Initial guess
+    M_inv_func : callable or None
+        Preconditioner: solves M^{-1} @ X
+    max_iter : int
+    tol : float
+    largest : bool
+        If True, compute largest eigenvalues
+
+    Returns
+    -------
+    eigvals : (k,)
+    eigvecs : (n, k)
+    """
+
+    device = X0.device
+    n, k = X0.shape
+
+    X = orthonormalize(X0)
+    P = torch.zeros_like(X)
+
+    for it in range(max_iter):
+
+        AX = A_func(X)
+        Lambda = torch.sum(X * AX, dim=0)
+        R = AX - X * Lambda
+
+        res_norm = torch.linalg.norm(R)
+        if res_norm < tol:
+            break
+
+        # 🔷 Preconditioning
+        if M_inv_func is not None:
+            W = M_inv_func(R)
+        else:
+            W = R
+
+        # Build block subspace
+        K = torch.cat([X, W, P], dim=1)
+
+        AK = A_func(K)
+
+        # Rayleigh–Ritz projection
+        M_small = K.T @ AK
+        B_small = K.T @ K
+
+        # Solve small generalized eigenproblem safely
+        # B_small is SPD
+        L = torch.linalg.cholesky(B_small)
+        Linv = torch.cholesky_inverse(L)
+
+        T = Linv @ M_small @ Linv.T
+        eigvals_small, eigvecs_small = torch.linalg.eigh(T)
+
+        if largest:
+            idx = torch.argsort(eigvals_small, descending=True)
+        else:
+            idx = torch.argsort(eigvals_small)
+
+        eigvals_small = eigvals_small[idx]
+        eigvecs_small = eigvecs_small[:, idx]
+
+        C = Linv.T @ eigvecs_small[:, :k]
+
+        X_new = K @ C
+
+        P = X_new - X
+        X = orthonormalize(X_new)
+
+    AX = A_func(X)
+    eigvals = torch.sum(X * AX, dim=0)
+
+    return eigvals, X
+
+
+if __name__ == "__main__":
+    # Example usage
+    A_sparse = None ## TODO: create a sparse matrix A_sparse as torch.sparse_coo_tensor
+    
+    # 假设你已有稀疏矩阵 A_sparse (torch.sparse_coo_tensor)
+    def A_func(X):
+        return torch.sparse.mm(A_sparse, X)
+
+
+    # Jacobi 预条件
+    diag_A = A_sparse.to_dense().diag()
+
+    def M_inv_func(R):
+        return R / diag_A.unsqueeze(1)
+
+
+    n = 1000
+    k = 5
+
+    X0 = torch.randn(n, k, device="cuda")
+
+    eigvals, eigvecs = LOBPCG(
+        A_func,
+        X0,
+        M_inv_func=M_inv_func,
+        max_iter=50
+    )
+
+    print(eigvals)

@@ -1,1 +1,5 @@
 scikit-sparse
+tqdm
+lightning
+scipy
+torch >= 2.4.1
