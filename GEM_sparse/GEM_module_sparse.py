@@ -70,7 +70,7 @@ class GraphLearningModule(nn.Module):
         return w # (N, k)
     
 class Generalized_EM(nn.Module):
-    def __init__(self, num_nodes, num_neighbors, neighbor_list, mu, gamma, step_size, emb_dim=6, feature_dim=3, c=8, theta=0.5, method='CG', inv_method='L+eI', use_proxy_loss=True, CG_iters=10, PGD_iters=100, PGD_step_size=0.01, scale=True, GEM_iters=5, epsilon=0.2, M1_iters=5, update_theta=True):
+    def __init__(self, num_nodes, num_neighbors, neighbor_list, mu, gamma, step_size, emb_dim=6, feature_dim=3, c=8, theta=0.5, method='CG', inv_method='L+eI', use_proxy_loss=True, CG_iters=10, PGD_iters=100, PGD_step_size=0.01, scale=True, GEM_iters=5, epsilon=0.2, M1_iters=5, update_theta=True, e_M2=1.0, MM_step2=False):
         super(Generalized_EM, self).__init__()
         self.glm = GraphLearningModule(num_nodes, num_neighbors, neighbor_list, emb_dim, feature_dim, c, theta)
         self.neighbor_list = neighbor_list
@@ -96,6 +96,9 @@ class Generalized_EM(nn.Module):
         self.epsilon = epsilon
         self.M1_iters = M1_iters
         self.update_theta = update_theta
+        self.e_M2 = e_M2 # for MM-optimized M2
+        self.MM_step2 = MM_step2
+
     def scale_w(self, w):
         '''
         scale to fit F-norm constraint of Laplacian (||L||_F = c)
@@ -408,7 +411,7 @@ class Generalized_EM(nn.Module):
         for iter in range(self.PGD_iters):
             # PGD
             A_old = A.clone()
-            A_new = A_old - self.PGD_step_size * w_0_alpha * (edge_diff_squares - r_tilde)
+            A_new = A_old - self.PGD_step_size * w_0_alpha * (edge_diff_squares - r_tilde)  # gradient step
             A_new = self.soft_thresholding(A_new, tau=self.PGD_step_size * self.gamma)
             if torch.isnan(A_new).any():
                 print('w_0 has nan', torch.isnan(w_0).any())
@@ -429,6 +432,134 @@ class Generalized_EM(nn.Module):
         
         return A
     
+    def M_step_2_MM_log(self, x, w_0, A_init=None):
+        # Implementation for M-step 2 using MM algorithm
+        A = A_init if A_init is not None else self.neighbor_mask.float()
+        w, alpha = self.scale_w(w_0 * A)  # initial scaling
+        # pre-fill the initial values
+        w_0_alpha = w_0 * alpha
+        # pass
+        assert torch.isnan(w).any() == False, "w has NaN values!"
+        assert torch.all(w >= 0.0), "w has negative values!"
+        print('w', w)
+        # print('w', w)
+        r_tilde = self._r_tilde(w)  # (N, k)
+        assert torch.isnan(r_tilde).any() == False, "r_tilde has NaN values!"
+        print('tr(RL)=', (r_tilde * w).sum().item() / 2)  # check validation, = n-1
+        # for fixed x, edge_diffs is fixed
+        edge_diff_squares = self._edge_diff_square(x)  # (N, k)
+
+        # Lipschitz constant
+        N = self.num_nodes
+        Lw = (math.sqrt(N)+1) ** 2 / self.epsilon ** 2   # (1/mu * ||L||_2 + epsilon)^2
+        print('Lipschitz constant for w:', Lw)
+
+        eta = torch.where(self.neighbor_mask, self.gamma / (w_0_alpha * Lw * math.log(1 / self.e_M2 + 1)), torch.zeros_like(w_0_alpha))  # adaptive step size
+        print('eta statistics', 'mean=', eta.mean().item(), ', max=', eta.max().item())
+
+        for iter in range(self.PGD_iters):
+            # PGD
+            A_old = A.clone()
+            z = A_old - (edge_diff_squares - r_tilde) / (2 * Lw)  # MM update
+            # eta = self.PGD_step_size / (w_0_alpha * Lw * math.log(1 / self.e_M2 + 1))  # adaptive step size
+            # print('eta', eta)
+            print('z statistics', 'zeros count=', (z[self.neighbor_mask] == 0).sum().item(), ', mean=', z[self.neighbor_mask].mean().item(), ', max=', z[self.neighbor_mask].max().item())
+            mask_0 = self.neighbor_mask.float().clone()
+            total_edges = self.neighbor_mask.float().sum().item()
+            mask_0[(z + self.e_M2) ** 2 <= 4 * eta] = 0.0
+            print('masked edges', (total_edges - mask_0.sum().item())/2)
+            masked_eta = eta[mask_0.bool()]
+            assert torch.isnan(masked_eta).any() == False, "masked_eta has NaN values!"
+            print('eta statistics', 'mean=', masked_eta.mean().item(), ', max=', masked_eta.max().item())
+            masked_z = z[mask_0.bool()]
+            # second rood update
+            masked_A2 = (masked_z - self.e_M2 + torch.sqrt((masked_z + self.e_M2) ** 2 - 4 * masked_eta)) / 2
+            # truncate to 1
+            masked_A2 = torch.clamp(masked_A2, min=0.0, max=1.0)
+            assert torch.isnan(masked_A2).any() == False, "masked_A2 has NaN values!"
+
+            # masked_A2 = A2[mask_0.bool()]
+            # masked_z = z[mask_0.bool()]
+            # masked_eta = eta[mask_0.bool()]
+
+            # print('masked_A2', masked_A2.shape)
+            # print('masked_z', masked_z.shape)
+
+            # compare the objective with A_new or 0
+            obj_new = (masked_A2 - masked_z) ** 2 + 2 * masked_eta * torch.log(masked_A2 / self.e_M2 + 1)
+            assert torch.isnan(obj_new).any() == False, "obj_new has NaN values!"
+            obj_0 = masked_z ** 2
+            assert torch.isnan(obj_0).any() == False, "obj_0 has NaN values!"
+
+            A = torch.zeros_like(A)  # initialize A_new with zeros
+
+            # print(mask_0.shape, masked_A2.shape, masked_z.shape, obj_new.shape, obj_0.shape)
+            A[mask_0.bool()] = torch.where(obj_new < obj_0, masked_A2, torch.zeros_like(masked_A2))  # if obj_new < obj_0, keep A2, else set to 0
+
+            assert torch.isnan(A).any() == False, "A_new has NaN values!"
+
+            A = A * self.neighbor_mask.float()  # mask non-edges
+            # print('neighbor_mask', self.neighbor_mask.float())
+            print('A_new statistics: zeros=', (A[self.neighbor_mask] == 0).sum().item(), ', ones=', (A[self.neighbor_mask] == 1).sum().item(), ', mean=', A[self.neighbor_mask].mean().item())
+
+            assert torch.allclose(A * self.neighbor_mask.float(), A), "A_new has non-zero weights on non-edges!"
+
+            
+            # recompute graphs
+            w = w_0_alpha * A  # (N, k)
+            r_tilde = self._r_tilde(w)  # (N, k)
+            print(f'  MM_log Iter {iter+1}/{self.PGD_iters}, tr(RL)=', (r_tilde * w).sum().item() / 2)  # check validation, = n-1
+    
+        return A
+    
+    def M_step_2_MM(self, x, w_0, A_init=None):
+        # Implementation for M-step 2 using MM algorithm
+        A = A_init if A_init is not None else self.neighbor_mask.float()
+        w, alpha = self.scale_w(w_0 * A)  # initial scaling
+        # pre-fill the initial values
+        w_0_alpha = w_0 * alpha
+        # pass
+        assert torch.isnan(w).any() == False, "w has NaN values!"
+        assert torch.all(w >= 0.0), "w has negative values!"
+        print('w', w)
+        # print('w', w)
+        r_tilde = self._r_tilde(w)  # (N, k)
+        assert torch.isnan(r_tilde).any() == False, "r_tilde has NaN values!"
+        print('tr(RL)=', (r_tilde * w).sum().item() / 2)  # check validation, = n-1
+        # for fixed x, edge_diffs is fixed
+        edge_diff_squares = self._edge_diff_square(x)  # (N, k)
+
+        # Lipschitz constant
+        N = self.num_nodes
+        Lw = (math.sqrt(N)+1) ** 2 / self.epsilon ** 2   # (1/mu * ||L||_2 + epsilon)^2
+        print('Lipschitz constant for w:', Lw)
+
+        eta = torch.where(self.neighbor_mask, self.gamma / (w_0_alpha * Lw), torch.zeros_like(w_0_alpha))  # adaptive step size
+        print('eta statistics', 'mean=', eta.mean().item(), ', max=', eta.max().item())
+
+        for iter in range(self.PGD_iters):
+            # PGD
+            A_old = A.clone()
+            A_new = A_old - (edge_diff_squares - r_tilde) / ( Lw)  # MM update
+            # eta = torch.where(self.neighbor_mask, self.gamma / (w_0_alpha * Lw), torch.zeros_like(w_0_alpha))  # adaptive step size
+            A_new = self.soft_thresholding(A_new, tau=eta)  # adaptive thresholding
+            A_new = torch.clamp(A_new, min=0.0, max=1.0) # project to [0, 1]
+            if torch.isnan(A_new).any():
+                print('w_0 has nan', torch.isnan(w_0).any())
+                print('A_old has nan', torch.isnan(A_old).any())
+                print('edge_diff_squares has nan', torch.isnan(edge_diff_squares).any())
+                print('r_tilde has nan', torch.isnan(r_tilde).any())
+                raise ValueError('NaN detected in A_new computation!')
+            A_new = A_new * self.neighbor_mask.float()  # mask non-edges
+
+            A = A_new
+            # recompute graphs
+            w = w_0_alpha * A  # (N, k)
+            r_tilde = self._r_tilde(w)  # (N, k)
+            print(f'  MM_l0 Iter {iter+1}/{self.PGD_iters}, tr(RL)=', (r_tilde * w).sum().item() / 2)  # check validation, = n-1
+    
+        return A
+
     def single_step(self, y, w_0, A, params=None):
         '''
         GEM framework:
@@ -469,7 +600,10 @@ class Generalized_EM(nn.Module):
 
 
         # M step 2
-        A_new = self.M_step_2(x, w_0, A)
+        if self.MM_step2:
+            A_new = self.M_step_2_MM(x, w_0, A_init=A)
+        else:
+            A_new = self.M_step_2(x, w_0, A)
 
 
         return x, w_0, A_new, new_params
@@ -512,7 +646,7 @@ class Generalized_EM(nn.Module):
 
             w_plot = w.clone().detach().numpy()
             # w_sparsemax = sparse_W.clone().detach().numpy()
-            if it % epochs == 0:
+            if (it+1) % epochs == 0:
                 print('A statistics: min=', A[self.neighbor_mask].min().item(), ', max=', A[self.neighbor_mask].max().item(), ', mean=', A[self.neighbor_mask].mean().item())
                 print('w_0 statistics: min=', w_0[self.neighbor_mask].min().item(), ', max=', w_0[self.neighbor_mask].max().item(), ', mean=', w_0[self.neighbor_mask].mean().item())
                 print('w statistics: min=', w[self.neighbor_mask].min().item(), ', max=', w[self.neighbor_mask].max().item(), ', mean=', w[self.neighbor_mask].mean().item())
