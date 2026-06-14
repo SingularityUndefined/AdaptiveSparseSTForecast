@@ -7,8 +7,9 @@ import math
 import scipy.sparse as sp
 import numpy as np
 from sparse_CG import *
-from utils_sparse import draw_graph
+from utils_sparse import draw_graph, draw_weighted_circular_graph
 from sparsemax import Sparsemax
+from sklearn.covariance import GraphicalLassoCV, GraphicalLasso
 
 class GraphLearningModule(nn.Module):
     # generate weight matrix from node embeddings
@@ -86,7 +87,7 @@ class Generalized_EM(nn.Module):
         self.gamma = gamma
         self.scale = scale
         self.method = method
-        assert method in ['CG', 'cholmod', 'Hutchinson'], "Only 'CG' and 'cholmod' are supported currently."
+        assert method in ['CG', 'chebyshev', 'cholmod', 'Hutchinson'], "Only 'CG' and 'cholmod' are supported currently."
         self.CG_iters = CG_iters
         self.PGD_iters = PGD_iters
         self.use_proxy_loss = use_proxy_loss
@@ -98,6 +99,16 @@ class Generalized_EM(nn.Module):
         self.update_theta = update_theta
         self.e_M2 = e_M2 # for MM-optimized M2
         self.MM_step2 = MM_step2
+
+    def dense_W_to_sparse(self, W):
+        # W in (N, N), resize to current neighbor structure
+        N = W.size(0)
+        row_indices = torch.arange(N).unsqueeze(1).repeat(1, self.num_neighbors).view(-1)  # (N*k,)
+        col_indices = self.neighbor_list.view(-1)  # (N*k,)
+        values = W[row_indices, col_indices]  # (N*k,)
+        values = values * self.neighbor_mask.view(-1).float()  # mask non-edges
+        W_sparse = values.view(N, self.num_neighbors)  # (N, k)
+        return W_sparse
 
     def scale_w(self, w):
         '''
@@ -205,6 +216,104 @@ class Generalized_EM(nn.Module):
         inv_degree = 1.0 / degree  # (N,)
         return x * inv_degree.unsqueeze(0)  # (B, N)
     
+
+    @torch.no_grad()
+    def largest_eigenvalue_power_iteration(self, w, num_iters=100, func=apply_L_plus_J):
+        N = w.size(0)
+        x = torch.randn(N, device=w.device)
+        x = x / torch.norm(x)
+        for _ in range(num_iters):
+            x = func(x.unsqueeze(0), w).squeeze(0)
+            x = x / torch.norm(x)
+        lambda_max = (func(x.unsqueeze(0), w).squeeze(0) @ x).item()
+        return lambda_max
+
+    @torch.no_grad()
+    def lanczos_smallest_eigenvalue(self, w, k=5, func=apply_L_plus_J):
+        q = torch.randn(self.num_nodes, device=w.device)
+        q = q / q.norm()
+
+        Q = []
+        alpha = []
+        beta = []
+
+        q_prev = torch.zeros_like(q)
+
+        for i in range(k):
+            z = func(q.unsqueeze(0), w).squeeze(0)
+
+            a = (q @ z)
+            z = z - a * q - (beta[-1] * q_prev if i > 0 else 0)
+
+            b = z.norm()
+
+            Q.append(q)
+            alpha.append(a)
+            beta.append(b)
+
+            q_prev = q
+            q = z / (b + 1e-12)
+
+        # build tridiagonal matrix
+        T = torch.diag(torch.tensor(alpha)) + \
+            torch.diag(torch.tensor(beta[:-1]), 1) + \
+            torch.diag(torch.tensor(beta[:-1]), -1)
+
+        eigvals = torch.linalg.eigvalsh(T)
+
+        return eigvals[0]  # λ_min
+    
+
+    # TODO: to be check whether requires grad
+    @torch.no_grad()
+    def apply_chebyshev_L_inverse(self, b, w, func, m=5, lambda_max=None, lambda_min=None):
+        # b: (B, N), approximate L^{-1} b with Chebyshev on [lambda_min, lambda_max]
+        N = b.size(1)
+        if lambda_max is None:
+            lambda_max = self.largest_eigenvalue_power_iteration(w, func=func)
+        if lambda_min is None:
+            lambda_min = self.lanczos_smallest_eigenvalue(w, k=8, func=func)
+
+        print('chebyshev lambda_max:', lambda_max, 'lambda_min:', lambda_min)
+
+        a, bmax = lambda_min, lambda_max
+        half = 0.5 * (bmax - a)
+        center = 0.5 * (bmax + a)
+
+        # Chebyshev coefficients for g(t)=1/(half*t+center), t in [-1,1]
+        # DCT-type quadrature
+        thetas = (torch.arange(m, device=b.device, dtype=b.dtype) + 0.5) * math.pi / m
+        t_nodes = torch.cos(thetas)
+        x_nodes = half * t_nodes + center
+        g_nodes = 1.0 / x_nodes
+
+        coeffs = torch.empty(m, device=b.device, dtype=b.dtype)
+        coeffs[0] = g_nodes.mean()
+        for k in range(1, m):
+            coeffs[k] = (2.0 / m) * torch.sum(g_nodes * torch.cos(k * thetas))
+
+        def apply_L_tilde(v):
+            # L_tilde = (2L - (lambda_max+lambda_min)I)/(lambda_max-lambda_min)
+            Lv = func(v, w)  # v: (B, N) -> (B, N)
+            return (2.0 * Lv - (a + bmax) * v) / (bmax - a)
+
+        # Chebyshev recurrence
+        T0 = b
+        if m == 1:
+            return coeffs[0] * T0
+
+        T1 = apply_L_tilde(b)
+        out = coeffs[0] * T0 + coeffs[1] * T1
+
+        for k in range(2, m):
+            Tk = 2.0 * apply_L_tilde(T1) - T0
+            out = out + coeffs[k] * Tk
+            T0, T1 = T1, Tk
+
+        # drop mean, recover the property that L^{-1} has zero row sums, which is important for the correctness of r_tilde
+        # out = out - out.mean(dim=1, keepdim=True)
+        return out
+    
     def _r_tilde(self, w, CG_method='batch_PCG'):
         """
         solve (e_i - e_j)^T (L + J)^-1 (e_i - e_j) for all edges (i, j)
@@ -242,6 +351,11 @@ class Generalized_EM(nn.Module):
             # inv_ref = self.conjugated_gradients(A_func, e_input, tol=1e-6, max_iter=self.e_step_iters) # (N-1, N)
             inv_ref = torch.concat([torch.zeros((1, N), device=w.device), inv_ref], dim=0)
             
+        elif self.method == 'chebyshev':
+            func = self.apply_L_plus_J if self.inv_method == 'L+J' else self.apply_L_plus_epsilon_I
+            inv_ref = self.apply_chebyshev_L_inverse(e_input, w, func, m=8, lambda_min=self.epsilon if self.inv_method == 'L+eI' else None, lambda_max=None)  # (N-1, N)
+            inv_ref = torch.concat([torch.zeros((1, N), device=w.device), inv_ref], dim=0)
+
 
         elif self.method == 'cholmod':
             pass  #TODO To be implemented: use cholmod to solve the system
@@ -336,7 +450,7 @@ class Generalized_EM(nn.Module):
         # update W only on MM
         # Lipschitz constant
         N = self.num_nodes
-        Lw = (math.sqrt(N)+1) ** 2 / self.epsilon ** 2   # (1/mu * ||L||_2 + epsilon)^2
+        Lw = (math.sqrt(N) + 1) ** 2 / self.epsilon ** 2   # (1/mu * ||L||_2 + epsilon)^2
         print('Lipschitz constant for w:', Lw)
         # N = self.num_nodes
         for i in range(self.M1_iters):
@@ -362,7 +476,7 @@ class Generalized_EM(nn.Module):
             proxy_loss = self.GLR(x, w) - (r_tilde * w).sum() / 2 # each edge counted twice
             if self.inv_method == 'L+eI':
                 # Lipschitz constant
-                Lw = (math.sqrt(N)+1) ** 2 / self.epsilon ** 2   # (1/mu * ||L||_2 + epsilon)^2
+                Lw = (math.sqrt(N) + 1) ** 2 / self.epsilon ** 2   # (1/mu * ||L||_2 + epsilon)^2
                 print('Lipschitz constant for w:', Lw)
                 proxy_loss = proxy_loss + Lw / 2 * torch.sum((w - detached_w) ** 2)  # add L2 regularization on w to stabilize training
         else: #slq
@@ -411,7 +525,7 @@ class Generalized_EM(nn.Module):
         for iter in range(self.PGD_iters):
             # PGD
             A_old = A.clone()
-            A_new = A_old - self.PGD_step_size * w_0_alpha * (edge_diff_squares - r_tilde)  # gradient step
+            A_new = A_old - self.PGD_step_size * w_0_alpha * (edge_diff_squares - r_tilde) / 2  # gradient step
             A_new = self.soft_thresholding(A_new, tau=self.PGD_step_size * self.gamma)
             if torch.isnan(A_new).any():
                 print('w_0 has nan', torch.isnan(w_0).any())
@@ -451,7 +565,7 @@ class Generalized_EM(nn.Module):
 
         # Lipschitz constant
         N = self.num_nodes
-        Lw = (math.sqrt(N)+1) ** 2 / self.epsilon ** 2   # (1/mu * ||L||_2 + epsilon)^2
+        Lw = (math.sqrt(N) + 1) ** 2 / self.epsilon ** 2   # (1/mu * ||L||_2 + epsilon)^2
         print('Lipschitz constant for w:', Lw)
 
         eta = torch.where(self.neighbor_mask, self.gamma / (w_0_alpha * Lw * math.log(1 / self.e_M2 + 1)), torch.zeros_like(w_0_alpha))  # adaptive step size
@@ -531,18 +645,18 @@ class Generalized_EM(nn.Module):
 
         # Lipschitz constant
         N = self.num_nodes
-        Lw = (math.sqrt(N)+1) ** 2 / self.epsilon ** 2   # (1/mu * ||L||_2 + epsilon)^2
+        Lw = (math.sqrt(N) + 1) ** 2 / self.epsilon ** 2   # (1/mu * ||L||_2 + epsilon)^2
         print('Lipschitz constant for w:', Lw)
 
-        eta = torch.where(self.neighbor_mask, self.gamma / (w_0_alpha * Lw), torch.zeros_like(w_0_alpha))  # adaptive step size
+        eta = torch.where(self.neighbor_mask, 1 / (w_0_alpha * Lw), torch.zeros_like(w_0_alpha))  # adaptive step size
         print('eta statistics', 'mean=', eta.mean().item(), ', max=', eta.max().item())
 
         for iter in range(self.PGD_iters):
             # PGD
             A_old = A.clone()
-            A_new = A_old - (edge_diff_squares - r_tilde) / ( Lw)  # MM update
+            A_new = A_old - eta * w_0_alpha * (edge_diff_squares - r_tilde) / 2  # MM update
             # eta = torch.where(self.neighbor_mask, self.gamma / (w_0_alpha * Lw), torch.zeros_like(w_0_alpha))  # adaptive step size
-            A_new = self.soft_thresholding(A_new, tau=eta)  # adaptive thresholding
+            A_new = self.soft_thresholding(A_new, tau=eta * self.gamma)  # adaptive thresholding
             A_new = torch.clamp(A_new, min=0.0, max=1.0) # project to [0, 1]
             if torch.isnan(A_new).any():
                 print('w_0 has nan', torch.isnan(w_0).any())
@@ -608,7 +722,31 @@ class Generalized_EM(nn.Module):
 
         return x, w_0, A_new, new_params
     
-    def forward(self, y, w_init=None, A_init=None, params=None, epochs=1, w_GT=None):
+
+    def single_step_GLASSO(self, y, w_0, A, params=None):
+        w = w_0 * A  # (N, k)
+        w, _ = self.scale_w(w)
+        # E step
+        x = self.E_step(y, w)  # (B, N)
+        # update weight with glasso
+        glasso = GraphicalLasso(alpha=self.gamma, max_iter=50)
+        glasso.fit(x.detach().cpu().numpy())
+        w_dense_new = -torch.tensor(glasso.precision_, device=y.device, dtype=y.dtype)  # (N, N)
+        w_dense_new.fill_diagonal_(0.0)
+        w_dense_new = torch.clamp(w_dense_new, min=0.0)  # ensure non-negativity
+        print('w_dense', w_dense_new)
+        print('degrees', (w_dense_new > 0).sum(dim=1))
+
+        w_new = self.dense_W_to_sparse(w_dense_new)  # (N, k)
+        assert torch.allclose(w_new * self.neighbor_mask.float(), w_new), "w_new has non-zero weights on non-edges!"
+        assert torch.all(w_new >= 0.0), "w_new has negative values!"
+        A_new = torch.where(w > 0, torch.ones_like(w), torch.zeros_like(w))  # binary mask from glasso result
+        # get glasso w
+        # mask laplacian with A to get the observed entries
+
+        return x, w_new, A_new
+    
+    def forward(self, y, w_init=None, A_init=None, params=None, epochs=1, w_GT=None, use_GLASSO=False, graph_type='circular'):
     
         # init w and A
         w_0 = self.glm(y) if w_init is None else w_init
@@ -622,15 +760,23 @@ class Generalized_EM(nn.Module):
         w_plot = w.clone().detach().numpy()
         # w_plot[w_plot < 5e-3] = 0.0
         # TODO: init plot
-        draw_graph(self.neighbor_list, w, int(math.sqrt(self.num_nodes)), title='learned graph Iteration 0')
-        
+        if graph_type == 'grid':
+            draw_graph(self.neighbor_list, w_plot, int(math.sqrt(self.num_nodes)), title='learned graph Iteration 0')
+        else:
+            draw_weighted_circular_graph(self.neighbor_list, w_plot, title='learned graph Iteration 0')
+            # draw_graph(self.neighbor_list, w_plot, int(math.sqrt(self.num_nodes)), title='learned graph Iteration 0')
+
         for it in range(self.GEM_iters):
             print(f'Iteration {it+1}/{self.GEM_iters}')
-            x, w_0, A, new_params = self.single_step(y, w_0, A, params=params)
-            size_A = A.size()
-            w, _ = self.scale_w(w_0 * A)
-            params = new_params
-
+            if not use_GLASSO:
+                x, w_0, A, new_params = self.single_step(y, w_0, A, params=params)
+                size_A = A.size()
+                w, _ = self.scale_w(w_0 * A)
+                params = new_params
+            else:
+                x, w_0, A = self.single_step_GLASSO(y, w_0, A, params=params)
+                size_A = A.size()
+                w, _ = self.scale_w(w_0 * A)
             # A = Sparsemax(dim=-1)(A.view(1,-1)).view(size_A)  # project A by sparsemax
             # A = Sparsemax(dim=1)(A)  # project A by sparsemax
             # A_plot = A.clone().detach().numpy()
@@ -651,7 +797,11 @@ class Generalized_EM(nn.Module):
                 print('w_0 statistics: min=', w_0[self.neighbor_mask].min().item(), ', max=', w_0[self.neighbor_mask].max().item(), ', mean=', w_0[self.neighbor_mask].mean().item())
                 print('w statistics: min=', w[self.neighbor_mask].min().item(), ', max=', w[self.neighbor_mask].max().item(), ', mean=', w[self.neighbor_mask].mean().item())
                 print(f'left edges: {(A[self.neighbor_mask] > 0).sum().item() // 2} / {self.neighbor_mask.sum().item() // 2}')
-                draw_graph(self.neighbor_list, w_plot, int(math.sqrt(self.num_nodes)), title=f'learned graph Iteration {it+1}')
+                if graph_type == 'grid':
+                    draw_graph(self.neighbor_list, w_plot, int(math.sqrt(self.num_nodes)), title=f'learned graph Iteration {it+1}')
+                else:
+                    draw_weighted_circular_graph(self.neighbor_list, w_plot, title=f'learned graph Iteration {it+1}')
+                    # draw_graph(self.neighbor_list, w_plot, int(math.sqrt(self.num_nodes)), title=f'learned graph Iteration {it+1}')
 
                 metric = (w - w_GT).norm().item() / w_GT.norm().item()
                 print('|W - W_GT|/|W_GT|:', metric)

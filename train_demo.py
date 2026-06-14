@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
-from model.unrolled_GEM import UnrolledGEM
+from model_update_theta.unrolled_GEM import UnrolledGEM
 from dataloader.data_utils import *
 import time
 from tqdm import tqdm   
 
 # Generate graph and data
+torch.manual_seed(0)
 n_row = 32
 kernel = 5
 assert kernel % 2 == 1, "kernel size must be odd"
@@ -20,7 +21,7 @@ nearest_neighbors = generate_kNN_from_grid(n_row, kernel, k)
 neighbor_mask = nearest_neighbors != -1
 
 # Model initialization
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
 model_param_dict = {
     'num_nodes': num_nodes,
     'num_neighbors': k,
@@ -31,15 +32,15 @@ model_param_dict = {
     'feature_dim': feature_dim,
     'c': 80,
     'theta': 0.5,
-    'method': 'Hutchinson',
+    'method': 'CG',  # 'CG', 'chebyshev', 'cholmod', 'Hutchinson'
     'inv_method': 'L+J',
     'E_step_iters': 3,
     'inv_CG_iters': 3,
-    'PGD_iters': 8,
+    'PGD_iters': 6,
     'PGD_step_size': 0.1,
     'M1_step_size': 0.01,
     'scale': True,
-    'GEM_iters': 4,
+    'GEM_iters': 3,
     'full_unrolling': True
 }
 
@@ -52,7 +53,7 @@ print(f'Model total parameters: {total_params}')
 model.train()
 y = y.to(device)
 target = torch.zeros_like(y).to(device)
-batch_size = 32
+batch_size = 16
 num_batches = y.shape[0] // batch_size
 
 

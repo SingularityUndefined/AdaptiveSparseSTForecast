@@ -135,6 +135,37 @@ def generate_grid_kNN_mask(n_row, kernel, k):
     mask = (neighbor_list != -1) & (neighbor_list.unsqueeze(2) == grid_neighbors.unsqueeze(1)).any(dim=2)
     return mask
 
+
+def generate_y_from_neighbor_list(neighbor_list, edge_weights, sigma, n):
+    num_nodes = neighbor_list.size(0)
+    L = torch.zeros((num_nodes, num_nodes))
+    for i in range(num_nodes):
+        for j, neighbor in enumerate(neighbor_list[i]):
+            if neighbor.item() != -1:
+                L[i, neighbor.item()] = -edge_weights[i, j]
+        L[i, i] = -L[i].sum()
+    # L = L + L.t()  # 对称
+    # for i in range(num_nodes):
+        # L[i, i] = -L[i].sum()  # 设置对角元素
+    print('weights', L)
+    print(L.sum(dim=1))  # 验证行和为0
+    assert torch.allclose(L, L.t()), "Laplacian matrix is not symmetric"
+    # assert torch.all(L.sum(dim=1) == 0), "Laplacian rows do not sum to zero"
+    
+    J = torch.ones((num_nodes,num_nodes), device=L.device) / num_nodes
+    L_pinv = torch.linalg.inv(L + J) - J
+
+    cov = sigma**2 * torch.eye(num_nodes) + L_pinv
+    cov = (cov + cov.t()) / 2
+    
+    y = torch.distributions.MultivariateNormal(
+        loc=torch.zeros(num_nodes),
+        covariance_matrix=cov
+    ).sample((n,))
+    
+    return y, L
+
+
 def generate_y_from_grid(n_row, sigma, n, edge_weights=0.6):
     num_nodes = n_row * n_row
     neighbor_list = generate_grid_neigbhors(n_row)
@@ -179,6 +210,128 @@ def generate_y_from_grid(n_row, sigma, n, edge_weights=0.6):
     ).sample((n,))
     
     return y
+
+
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+
+
+def draw_weighted_circular_graph(adj_padded, weight_padded, title=None, alpha=0.85):
+    """
+    Draw weighted graph from adjacency list + weights.
+
+    Args:
+        adj_padded: (n, max_degree)
+            adjacency list padded with -1
+
+        weight_padded: (n, max_degree)
+            edge weights aligned with adj_padded
+
+            edges with weight == 0 are ignored
+    """
+
+    n = adj_padded.shape[0]
+
+    G = nx.Graph()
+
+    G.add_nodes_from(range(n))
+
+    # add weighted edges
+    for i in range(n):
+
+        for k in range(adj_padded.shape[1]):
+
+            j = adj_padded[i, k]
+
+            if j == -1:
+                continue
+
+            j = int(j)
+
+            w = weight_padded[i, k]
+
+            # skip zero-weight edges
+            if w == 0:
+                continue
+
+            # avoid duplicate undirected edges
+            if i < j:
+                G.add_edge(i, j, weight=w)
+
+    # count edges
+    num_edges = G.number_of_edges()
+    print(f"Graph has {num_edges} edges")
+
+    # circular layout
+    pos = nx.circular_layout(G)
+
+    # 获取边权重
+    edge_attr = nx.get_edge_attributes(G, "weight")
+    edge_weights = np.array([edge_attr[e] for e in G.edges()])
+
+    # colormap 映射
+    norm = plt.Normalize(vmin=0, vmax=1)
+    cmap = plt.cm.YlGnBu
+
+    # 🔑 创建 figure / axes
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # 1️⃣ 按权重排序绘制边（小权重先，大权重后）
+    edges_sorted = sorted(G.edges(data=True), key=lambda e: e[2]["weight"])
+    for e in edges_sorted:
+        u, v, d = e
+        # print(u,v,d)
+        w = float(d["weight"])
+        # print(w)
+        color = cmap(np.sqrt(w))
+        lc = nx.draw_networkx_edges(
+            G, pos,
+            edgelist=[(u, v)],
+            width=1.0 + 2.0 * w,
+            edge_color=[color],
+            alpha=alpha,
+            ax=ax
+        )
+        lc.set_zorder(w)  # 权重大 → 在上面显示
+
+    # 2️⃣ 绘制节点
+    lc = nx.draw_networkx_nodes(
+        G, pos,
+        ax=ax,
+        node_color='lightgrey',
+        edgecolors='grey',  # 节点轮廓
+        linewidths=1.5,
+    )
+    lc.set_zorder(edge_weights.max() + 1)
+
+    nx.draw_networkx_labels(
+        G, pos,
+        ax=ax,
+        # font_size=10,
+        font_color='black', 
+    )
+
+
+    # 3️⃣ 可选边标签
+    # edge_labels = {(u, v): f'{d["weight"]:.2f}' for (u, v, d) in G.edges(data=True)}
+    # nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, ax=ax)
+
+    # 4️⃣ colorbar
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])  # 必须设置
+    cbar = fig.colorbar(sm, ax=ax, label="edge weight (sqrt scale)", shrink=0.8)
+    # 可选：colorbar刻度显示原始weight而不是sqrt
+    tick_locs = np.linspace(0, np.sqrt(edge_weights.max()), 5)
+    cbar.set_ticks(tick_locs)
+    cbar.set_ticklabels([f"{t**2:.2f}" for t in tick_locs])
+
+    if title is not None:
+        ax.set_title(title, fontsize=14, pad=12)
+
+    ax.set_aspect("equal")
+    ax.axis("off")
+    plt.show()
 
 
 # Example usage

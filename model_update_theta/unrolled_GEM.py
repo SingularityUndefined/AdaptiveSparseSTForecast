@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from sksparse.cholmod import cholesky
 import scipy.sparse as sp
 import numpy as np
-from sparse_CG import Lanczos
+from .sparse_CG import Lanczos
 
 '''
 Graph Learning Module
@@ -28,7 +28,7 @@ class GraphLearningModule(nn.Module):
         self.fc = nn.Linear(emb_dim + 1, feature_dim)
         self.leakyrelu = nn.LeakyReLU(0.2)
         self.c = c
-        self.theta = nn.Parameter(torch.tensor(theta))
+        self.raw_theta = nn.Parameter(torch.tensor(theta))
 
     def forward(self, x, params=None):
         """
@@ -39,13 +39,14 @@ class GraphLearningModule(nn.Module):
             node_embeddings = self.node_embeddings
             fc_weight = self.fc.weight
             fc_bias = self.fc.bias
-            theta = self.theta
+            raw_theta = self.raw_theta
         else:
             node_embeddings = params["node_embeddings"]
             fc_weight = params["fc.weight"]
             fc_bias = params["fc.bias"]
-            theta = params["theta"]
+            raw_theta = params["raw_theta"]
 
+        theta = F.softplus(raw_theta) + 1e-3  # ensure positivity and numerical stability
         B = x.size(0)
 
         # 1. embed each node (add)
@@ -66,8 +67,11 @@ class GraphLearningModule(nn.Module):
             raise ValueError('NaN detected in w computation!')
         
         assert torch.isnan(w).any() == False, "w has NaN values!"
+        print(torch.isnan(e).any(), torch.isnan(f).any(), torch.isnan(w).any())
+        print(torch.isinf(e).any(), torch.isinf(f).any(), torch.isinf(w).any())
 
         w = w * self.neighbor_mask.float()  # mask non-edges
+        assert torch.isnan(self.neighbor_mask.float()).any() == False, "mask has NaN values after masking!"
         # assert torch.isnan(w).any() == False, "w has NaN values!"
         assert torch.allclose(w * self.neighbor_mask.float(), w), f"w has non-zero weights on non-edges!, difference {(w * self.neighbor_mask.float() - w).abs().max().item()}"
 
@@ -148,7 +152,7 @@ class UnrolledGEM(nn.Module):
         self.scale = scale
 
         self.method = method
-        assert method in ['CG', 'cholmod', 'Hutchinson'], "Only 'CG', 'cholmod', and 'Hutchinson' are supported currently."
+        assert method in ['CG', 'chebyshev', 'cholmod', 'Hutchinson'], "Only 'CG', 'chebyshev', 'cholmod', and 'Hutchinson' are supported currently."
 
         # create graph or not
         self.full_unrolling = full_unrolling
@@ -235,6 +239,104 @@ class UnrolledGEM(nn.Module):
         inv_degree = 1.0 / degree  # (N,)
         return x * inv_degree.unsqueeze(0)  # (B, N)
     
+
+    @torch.no_grad()
+    def largest_eigenvalue_power_iteration(self, w, num_iters=100, func=apply_L_plus_J):
+        N = w.size(0)
+        x = torch.randn(N, device=w.device)
+        x = x / torch.norm(x)
+        for _ in range(num_iters):
+            x = func(x.unsqueeze(0), w).squeeze(0)
+            x = x / torch.norm(x)
+        lambda_max = (func(x.unsqueeze(0), w).squeeze(0) @ x).item()
+        return lambda_max
+
+    @torch.no_grad()
+    def lanczos_smallest_eigenvalue(self, w, k=5, func=apply_L_plus_J):
+        q = torch.randn(self.num_nodes, device=w.device)
+        q = q / q.norm()
+
+        Q = []
+        alpha = []
+        beta = []
+
+        q_prev = torch.zeros_like(q)
+
+        for i in range(k):
+            z = func(q.unsqueeze(0), w).squeeze(0)
+
+            a = (q @ z)
+            z = z - a * q - (beta[-1] * q_prev if i > 0 else 0)
+
+            b = z.norm()
+
+            Q.append(q)
+            alpha.append(a)
+            beta.append(b)
+
+            q_prev = q
+            q = z / (b + 1e-12)
+
+        # build tridiagonal matrix
+        T = torch.diag(torch.tensor(alpha)) + \
+            torch.diag(torch.tensor(beta[:-1]), 1) + \
+            torch.diag(torch.tensor(beta[:-1]), -1)
+
+        eigvals = torch.linalg.eigvalsh(T)
+
+        return eigvals[0]  # λ_min
+    
+
+    # TODO: to be check whether requires grad
+    # @torch.no_grad()
+    def apply_chebyshev_L_inverse(self, b, w, func, m=5, lambda_max=None, lambda_min=None):
+        # b: (B, N), approximate L^{-1} b with Chebyshev on [lambda_min, lambda_max]
+        N = b.size(1)
+        if lambda_max is None:
+            lambda_max = self.largest_eigenvalue_power_iteration(w, func=func)
+        if lambda_min is None:
+            lambda_min = self.lanczos_smallest_eigenvalue(w, k=8, func=func)
+
+        print('chebyshev lambda_max:', lambda_max, 'lambda_min:', lambda_min)
+
+        a, bmax = lambda_min, lambda_max
+        half = 0.5 * (bmax - a)
+        center = 0.5 * (bmax + a)
+
+        # Chebyshev coefficients for g(t)=1/(half*t+center), t in [-1,1]
+        # DCT-type quadrature
+        thetas = (torch.arange(m, device=b.device, dtype=b.dtype) + 0.5) * math.pi / m
+        t_nodes = torch.cos(thetas)
+        x_nodes = half * t_nodes + center
+        g_nodes = 1.0 / x_nodes
+
+        coeffs = torch.empty(m, device=b.device, dtype=b.dtype)
+        coeffs[0] = g_nodes.mean()
+        for k in range(1, m):
+            coeffs[k] = (2.0 / m) * torch.sum(g_nodes * torch.cos(k * thetas))
+
+        def apply_L_tilde(v):
+            # L_tilde = (2L - (lambda_max+lambda_min)I)/(lambda_max-lambda_min)
+            Lv = func(v, w)  # v: (B, N) -> (B, N)
+            return (2.0 * Lv - (a + bmax) * v) / (bmax - a)
+
+        # Chebyshev recurrence
+        T0 = b
+        if m == 1:
+            return coeffs[0] * T0
+
+        T1 = apply_L_tilde(b)
+        out = coeffs[0] * T0 + coeffs[1] * T1
+
+        for k in range(2, m):
+            Tk = 2.0 * apply_L_tilde(T1) - T0
+            out = out + coeffs[k] * Tk
+            T0, T1 = T1, Tk
+
+        # drop mean, recover the property that L^{-1} has zero row sums, which is important for the correctness of r_tilde
+        # out = out - out.mean(dim=1, keepdim=True)
+        return out
+    
     def _r_tilde(self, w, CG_solver):
         """
         solve (e_i - e_j)^T (L + J)^-1 (e_i - e_j) for all edges (i, j)
@@ -267,7 +369,15 @@ class UnrolledGEM(nn.Module):
             # print(len(res_norms),'r_tilde CG residual norms:', res_norms)
             # inv_ref = self.conjugated_gradients(A_func, e_input, tol=1e-6, max_iter=self.e_step_iters) # (N-1, N)
             inv_ref = torch.concat([torch.zeros((1, N), device=device), inv_ref], dim=0)  # (N, N)
-            
+
+        elif self.method == 'chebyshev':
+            e = torch.eye(N, device=device)  # (N, N)
+            e_input = e[1:]
+            e_input[:,0] = e[1:,0] - 1 # reference point 0, e_input in shape (N-1, N)
+            # print('e_input shape:', e_input)
+            func = self.apply_L_plus_J if self.inv_method == 'L+J' else self.apply_L_plus_epsilon_I
+            inv_ref = self.apply_chebyshev_L_inverse(e_input, w, func, m=self.M1_CG_iters, lambda_min=self.epsilon if self.inv_method == 'L+eI' else None, lambda_max=None)  # (N-1, N)
+            inv_ref = torch.concat([torch.zeros((1, N), device=w.device), inv_ref], dim=0)
 
         elif self.method == 'cholmod':
             pass  #TODO To be implemented: use cholmod to solve the system
@@ -372,7 +482,7 @@ class UnrolledGEM(nn.Module):
             grads = torch.autograd.grad(proxy_loss, self.glm.parameters(), create_graph=self.full_unrolling, retain_graph=True) #create_graph=True)
             new_params = {}
             for (name, param), grad in zip(self.glm.named_parameters(), grads):
-                new_params[name] = param - self.step_size * grad
+                new_params[name] = param - self.M1_step_size * grad
                 param = new_params[name]  
         
         return new_params
