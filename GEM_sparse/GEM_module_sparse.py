@@ -71,7 +71,7 @@ class GraphLearningModule(nn.Module):
         return w # (N, k)
     
 class Generalized_EM(nn.Module):
-    def __init__(self, num_nodes, num_neighbors, neighbor_list, mu, gamma, step_size, emb_dim=6, feature_dim=3, c=8, theta=0.5, method='CG', inv_method='L+eI', use_proxy_loss=True, CG_iters=10, PGD_iters=100, PGD_step_size=0.01, scale=True, GEM_iters=5, epsilon=0.2, M1_iters=5, update_theta=True, e_M2=1.0, MM_step2=False):
+    def __init__(self, num_nodes, num_neighbors, neighbor_list, mu, gamma, step_size, emb_dim=6, feature_dim=3, c=8, theta=0.5, method='CG', inv_method='L+eI', use_proxy_loss=True, CG_iters=10, PGD_iters=100, PGD_step_size=0.01, scale=True, GEM_iters=5, epsilon=0.2, M1_iters=5, update_theta=True, e_M2=1.0, MM_step1=False, MM_step2=False, xi=1e-2, tau=0.2):
         super(Generalized_EM, self).__init__()
         self.glm = GraphLearningModule(num_nodes, num_neighbors, neighbor_list, emb_dim, feature_dim, c, theta)
         self.neighbor_list = neighbor_list
@@ -87,7 +87,7 @@ class Generalized_EM(nn.Module):
         self.gamma = gamma
         self.scale = scale
         self.method = method
-        assert method in ['CG', 'chebyshev', 'cholmod', 'Hutchinson'], "Only 'CG' and 'cholmod' are supported currently."
+        assert method in ['CG', 'chebyshev', 'cholmod', 'Hutchinson'], "Only 'CG', 'cholmod' and 'Hutchinson' are supported currently."
         self.CG_iters = CG_iters
         self.PGD_iters = PGD_iters
         self.use_proxy_loss = use_proxy_loss
@@ -98,7 +98,10 @@ class Generalized_EM(nn.Module):
         self.M1_iters = M1_iters
         self.update_theta = update_theta
         self.e_M2 = e_M2 # for MM-optimized M2
+        self.MM_step1 = MM_step1
         self.MM_step2 = MM_step2
+        self.xi = xi # for surrogate L0 regularization in PGD
+        self.tau = tau # for M2 optimization
 
     def dense_W_to_sparse(self, W):
         # W in (N, N), resize to current neighbor structure
@@ -199,7 +202,64 @@ class Generalized_EM(nn.Module):
         sparse_L = sp.coo_matrix((detached_all_values, (detached_all_row_indices, detached_all_col_indices)), shape=(N, N))
 
         return sparse_L
-    
+    def sparse_L_from_w(self, w):
+        # w in (N, k)
+        N = w.size(0)
+        k = w.size(1)
+        degree = torch.sum(w, dim=1)  # (N,)
+        row_indices = torch.arange(N, device=w.device).unsqueeze(1).repeat(1, k).view(-1)  # (N*k,)
+        col_indices = self.neighbor_list.to(w.device).view(-1)  # (N*k,)
+        values = -w.view(-1)  # (N*k,)
+        # mask non-edges
+        col_mask = (col_indices != -1)
+        row_indices = row_indices[col_mask]
+        col_indices = col_indices[col_mask]
+        values = values[col_mask]
+
+        # Diagonal entries
+        diag_row_indices = torch.arange(N, device=w.device)
+        diag_col_indices = torch.arange(N, device=w.device)
+        diag_values = degree
+
+        all_row_indices = torch.cat([row_indices, diag_row_indices])
+        all_col_indices = torch.cat([col_indices, diag_col_indices])
+        all_values = torch.cat([values, diag_values])
+
+        detached_all_row_indices = all_row_indices.detach().cpu().numpy()
+        detached_all_col_indices = all_col_indices.detach().cpu().numpy()
+        detached_all_values = all_values.detach().cpu().numpy()
+
+        sparse_L = sp.coo_matrix((detached_all_values, (detached_all_row_indices, detached_all_col_indices)), shape=(N, N))
+
+        return sparse_L
+
+    def logdetL(self, w):
+        '''
+        Compute logdet(L + epsilon I) or logdet(L + J) from sparse w.
+        w in (N, k). This is a non-differentiable exact sparse computation.
+        '''
+        N = w.size(0)
+        sparse_L = self.sparse_L_from_w(w.detach().cpu()).tocsc()
+
+        if self.inv_method == 'L+eI':
+            L_reg = sparse_L + self.epsilon * sp.eye(N, format='csc')
+            factor = cholesky(L_reg)
+            return factor.logdet()
+        elif self.inv_method == 'L+J':
+            # For a connected graph, det(L + J) = N * det(L with any row/col removed).
+            L_minor = sparse_L[1:, 1:].tocsc()
+            factor = cholesky(L_minor)
+            return factor.logdet() + math.log(N)
+        else:
+            raise ValueError(f"Unsupported inv_method: {self.inv_method}")
+        
+    def objective(self, x, w):
+        # compute the objective function value for current x and w
+        GLR_value = self.GLR(x, w)  # scalar
+        logdet = self.logdetL(w)  # scalar
+        log_sparse = self.gamma * torch.log(1 + w/self.xi).sum() / 2  # surrogate for L0 regularization
+        return (GLR_value - logdet + log_sparse).item()
+
     def apply_inv_D_plus_J(self, x, adj):
         # x in (B, N), adj in (N, N)
         N = adj.size(0)
@@ -447,8 +507,9 @@ class Generalized_EM(nn.Module):
 
     
     def M_step_1_w_only(self, x, w, A):
-        # update W only on MM
+        # update W only with a single GD step
         # Lipschitz constant
+        objective_old = self.objective(x, w)
         N = self.num_nodes
         Lw = (math.sqrt(N) + 1) ** 2 / self.epsilon ** 2   # (1/mu * ||L||_2 + epsilon)^2
         print('Lipschitz constant for w:', Lw)
@@ -456,10 +517,19 @@ class Generalized_EM(nn.Module):
         for i in range(self.M1_iters):
             detached_w = w.clone().detach()
             r_tilde = self._r_tilde(detached_w)  # (N, k)
-            w_update = w - (self._edge_diff_square(x) - r_tilde) / Lw
+            d_w = 0.5 * self._edge_diff_square(x) - 0.5 * r_tilde + self.gamma / (2 * (self.xi + detached_w))  # (N, k)
+            # w_update = detached_w - self.step_size * d_w  # gradient step
+            # TODO: alternativew_update
+            w_update = torch.clamp(detached_w - d_w / Lw, min=0.0)    # MM step with nonnegative constraint
             inv_A = torch.where(A > 0, 1.0 / A, torch.zeros_like(A))  # inverse of A with zero handling
+            # TODO: alternatives: a MM step
             w_0 = w_update * inv_A
-            w = w_0 * A  # apply mask
+            w = w_0 * A  # actual accepted w after applying mask
+
+            # compute metrics on the accepted w, not the raw w_update
+            objective_new = self.objective(x, w)
+            print(f'M-step 1 w-only iter {i+1}/{self.M1_iters}, objective: {objective_new:.4f} (old: {objective_old:.4f}), delta: {objective_new - objective_old:.4f})')
+            objective_old = objective_new
 
         return w_0
     
@@ -474,7 +544,7 @@ class Generalized_EM(nn.Module):
             print('tr(RL)=', (r_tilde * detached_w).sum().item() / 2) # check validation, = n-1
             print('use proxy loss')
             proxy_loss = self.GLR(x, w) - (r_tilde * w).sum() / 2 # each edge counted twice
-            if self.inv_method == 'L+eI':
+            if self.MM_step1:
                 # Lipschitz constant
                 Lw = (math.sqrt(N) + 1) ** 2 / self.epsilon ** 2   # (1/mu * ||L||_2 + epsilon)^2
                 print('Lipschitz constant for w:', Lw)
@@ -486,7 +556,7 @@ class Generalized_EM(nn.Module):
             print('logdet(L+J or L+eI)=', logdet)
             proxy_loss = self.GLR(x, w) - logdet
         # backward to gradient descent
-
+        proxy_loss  = proxy_loss + self.gamma * torch.log(1 + w/self.xi).sum() / 2  # add surrogate for L0 regularization on w to promote sparsity
         return proxy_loss
 
     def M_step_1(self, x, w):
@@ -504,7 +574,7 @@ class Generalized_EM(nn.Module):
     def soft_thresholding(self, A, tau):
         return torch.sign(A) * torch.clamp(torch.abs(A) - tau, min=0.0)
     
-    def M_step_2(self, x, w_0, A_init=None):
+    def M_step_2_PGD(self, x, w_0, A_init=None):
         '''
         PGD step to update the wacency mask A
         ''' 
@@ -545,6 +615,35 @@ class Generalized_EM(nn.Module):
             print(f'  PGD Iter {iter+1}/{self.PGD_iters}, tr(RL)=', (r_tilde * w).sum().item() / 2)  # check validation, = n-1
         
         return A
+    
+    def M_step_2(self, x, w_0, A_init=None):
+        # N = self.glm.num_nodes
+        A = A_init if A_init is not None else self.neighbor_mask.float()
+        w, _ = self.scale_w(w_0 * A)  # initial scaling
+        objective_old = self.objective(x, w)
+        # not detached here, need gradient flow
+        assert torch.isnan(w).any() == False, "w has NaN values!"
+        assert torch.all(w >= 0.0), "w has negative values!"
+        print('w', w)
+        r_tilde = self._r_tilde(w)  # (N, k)
+        print('tr(RL)=', (r_tilde * w).sum().item() / 2)  # check validation, = n-1
+        # for fixed x, edge_diffs is fixed
+        edge_diff_squares = self._edge_diff_square(x)  # (N, k)
+
+        importance = r_tilde - edge_diff_squares - self.gamma / (self.xi + w)  # (N, k)
+        importance = importance * w # (N, k), importance weighted by current edge weights, to prioritize important edges with large weights
+        A_new_select = torch.where(importance > self.tau, torch.ones_like(A), torch.zeros_like(A))  # (N, k)
+        A_new_deleted = torch.where(importance < -self.tau, torch.zeros_like(A), torch.ones_like(A))  # (N, k)
+        A_new = ((A + A_new_select) > 0) * A_new_deleted  # keep edges with importance > tau, remove edges with importance < -tau, keep others unchanged
+
+
+        A_new = A_new.float() * self.neighbor_mask.float()  # mask non-edges
+        print('A_new statistics: zeros=', (A_new[self.neighbor_mask] == 0).sum().item(), ', ones=', (A_new[self.neighbor_mask] == 1).sum().item(), ', mean=', A_new[self.neighbor_mask].mean().item())
+        w_new, _ = self.scale_w(w_0 * A_new)
+        objective_new = self.objective(x, w_new)
+        print(f'M-step 2 edge selection, objective: {objective_new:.4f} (old: {objective_old:.4f}), delta: {objective_new - objective_old:.4f})')
+        return A_new
+
     
     def M_step_2_MM_log(self, x, w_0, A_init=None):
         # Implementation for M-step 2 using MM algorithm
