@@ -45,12 +45,17 @@ For the factored matrix ``A(c)`` and edge incidence vectors ``b_e``:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Tuple, Union
+from typing import Iterable, Optional, Tuple, Union
 
 import numpy as np
 import scipy.sparse as sp
 import torch
 from sksparse.cholmod import cholesky
+
+try:
+    from utils_modules import _validate_undirected_edge_pairs
+except ModuleNotFoundError:  # pragma: no cover
+    from .utils_modules import _validate_undirected_edge_pairs
 
 
 _INV_METHODS = ("L+J", "L+eI")
@@ -660,20 +665,101 @@ def _multi_graph_effective_resistance_unshared(
     return torch.stack(outputs, dim=0)
 
 
+def _validate_multi_graph_undirected_edge_pairs(
+    neighbor_list: torch.Tensor,
+    neighbor_mask: torch.Tensor,
+) -> None:
+    if neighbor_list.dim() == 2:
+        _validate_undirected_edge_pairs(neighbor_list, neighbor_mask)
+        return
+
+    for graph in range(int(neighbor_mask.size(0))):
+        _validate_undirected_edge_pairs(
+            neighbor_list[graph],
+            neighbor_mask[graph : graph + 1],
+        )
+
+
+def _multi_graph_effective_resistance_dynamic_mask(
+    neighbor_list: Union[NeighborInput, MultiNeighborInput],
+    neighbor_mask: MultiMaskInput,
+    weight: torch.Tensor,
+    *,
+    root: int,
+    inv_method: str,
+    epsilon: float,
+    average_duplicates: bool,
+    backward_chunk_size: int,
+) -> torch.Tensor:
+    neighbor_cpu = _as_long_tensor(neighbor_list)
+    mask_cpu = _as_bool_tensor(neighbor_mask)
+    if mask_cpu.dim() != 3:
+        raise ValueError("neighbor_mask must have shape (num_graphs, N, k).")
+    if weight.dim() != 3 or tuple(weight.shape) != tuple(mask_cpu.shape):
+        raise ValueError(
+            "weight and neighbor_mask must both have shape (num_graphs, N, k)."
+        )
+
+    if neighbor_cpu.dim() == 2:
+        if tuple(mask_cpu.shape[1:]) != tuple(neighbor_cpu.shape):
+            raise ValueError(
+                "neighbor_mask must have shape (num_graphs, N, k), where "
+                "neighbor_list has shape (N, k)."
+            )
+    elif neighbor_cpu.dim() == 3:
+        if tuple(neighbor_cpu.shape) != tuple(mask_cpu.shape):
+            raise ValueError(
+                "neighbor_list and neighbor_mask must have the same shape when "
+                "neighbor_list is graph-specific."
+            )
+    else:
+        raise ValueError(
+            "neighbor_list must have shape (N, k) or (num_graphs, N, k)."
+        )
+
+    _validate_multi_graph_undirected_edge_pairs(neighbor_cpu, mask_cpu)
+
+    num_graphs = int(weight.size(0))
+    if num_graphs == 0:
+        return weight.new_zeros(weight.shape)
+
+    outputs = []
+    for graph in range(num_graphs):
+        graph_neighbor_list = (
+            neighbor_cpu if neighbor_cpu.dim() == 2 else neighbor_cpu[graph]
+        )
+        mapping = build_neighbor_to_edge_map(
+            graph_neighbor_list,
+            mask_cpu[graph],
+            average_duplicates=average_duplicates,
+        )
+        graph_resistance = _multi_graph_effective_resistance_with_mapping(
+            mapping,
+            weight[graph : graph + 1],
+            root=root,
+            inv_method=inv_method,
+            epsilon=epsilon,
+            backward_chunk_size=backward_chunk_size,
+        )
+        outputs.append(graph_resistance.squeeze(0))
+
+    return torch.stack(outputs, dim=0)
+
+
 class MultiGraphEffectiveResistance(torch.nn.Module):
     """Reusable ER module for multiple graphs.
 
     ``forward`` expects weights with shape ``(num_graphs, N, k)`` and returns
-    effective resistances with the same shape.  With ``shared_neighbor_list=True``,
-    all graphs share one ``neighbor_list`` and one ``neighbor_mask`` with shape
-    ``(N, k)``.  With ``shared_neighbor_list=False``, both constructor inputs
-    have shape ``(num_graphs, N, k)``.
+    effective resistances with the same shape.  Pass ``neighbor_mask`` to
+    ``forward`` when the active sparse structure changes between calls.  Dynamic
+    masks must have shape ``(num_graphs, N, k)``.  ``neighbor_list`` can be shared
+    with shape ``(N, k)`` or graph-specific with shape ``(num_graphs, N, k)``.
     """
 
     def __init__(
         self,
-        neighbor_list: NeighborInput,
-        neighbor_mask: MaskInput,
+        neighbor_list: Union[NeighborInput, MultiNeighborInput],
+        neighbor_mask: Optional[Union[MaskInput, MultiMaskInput]] = None,
         *,
         shared_neighbor_list: bool = True,
         root: int = 0,
@@ -693,7 +779,55 @@ class MultiGraphEffectiveResistance(torch.nn.Module):
         _validate_inv_method(self.inv_method, self.epsilon)
 
         neighbor_cpu = _as_long_tensor(neighbor_list)
+        self.register_buffer("neighbor_list", neighbor_cpu, persistent=False)
+        self.register_buffer("neighbor_mask", None, persistent=False)
+        self._has_static_mapping = False
+
+        if neighbor_mask is None:
+            if neighbor_cpu.dim() == 2:
+                self.num_graphs = None
+                self.num_nodes = int(neighbor_cpu.size(0))
+                self.original_shape = (
+                    int(neighbor_cpu.size(0)),
+                    int(neighbor_cpu.size(1)),
+                )
+            elif neighbor_cpu.dim() == 3:
+                self.num_graphs = int(neighbor_cpu.size(0))
+                self.num_nodes = int(neighbor_cpu.size(1))
+                self.original_shape = (
+                    int(neighbor_cpu.size(1)),
+                    int(neighbor_cpu.size(2)),
+                )
+            else:
+                raise ValueError(
+                    "neighbor_list must have shape (N, k) or (num_graphs, N, k)."
+                )
+            return
+
         mask_cpu = _as_bool_tensor(neighbor_mask)
+        self.neighbor_mask = mask_cpu
+        if mask_cpu.dim() == 3:
+            if neighbor_cpu.dim() == 2:
+                if tuple(mask_cpu.shape[1:]) != tuple(neighbor_cpu.shape):
+                    raise ValueError(
+                        "neighbor_mask must have shape (num_graphs, N, k), where "
+                        "neighbor_list has shape (N, k)."
+                    )
+            elif neighbor_cpu.dim() == 3:
+                if tuple(mask_cpu.shape) != tuple(neighbor_cpu.shape):
+                    raise ValueError(
+                        "neighbor_list and neighbor_mask must have the same shape when "
+                        "neighbor_list is graph-specific."
+                    )
+            else:
+                raise ValueError(
+                    "neighbor_list must have shape (N, k) or (num_graphs, N, k)."
+                )
+            self.num_graphs = int(mask_cpu.size(0))
+            self.num_nodes = int(mask_cpu.size(1))
+            self.original_shape = (int(mask_cpu.size(1)), int(mask_cpu.size(2)))
+            return
+
         if self.shared_neighbor_list:
             mapping = build_neighbor_to_edge_map(
                 neighbor_cpu,
@@ -704,6 +838,7 @@ class MultiGraphEffectiveResistance(torch.nn.Module):
             self.num_nodes = int(mapping.original_shape[0])
             self.original_shape = mapping.original_shape
             _register_mapping_buffers(self, "shared", mapping)
+            self._has_static_mapping = True
         else:
             if neighbor_cpu.dim() != 3:
                 raise ValueError(
@@ -725,8 +860,43 @@ class MultiGraphEffectiveResistance(torch.nn.Module):
                     average_duplicates=self.average_duplicates,
                 )
                 _register_mapping_buffers(self, f"graph_{graph}", mapping)
+            self._has_static_mapping = True
 
-    def forward(self, weight: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        weight: torch.Tensor,
+        neighbor_mask: Optional[MultiMaskInput] = None,
+    ) -> torch.Tensor:
+        if neighbor_mask is not None:
+            return _multi_graph_effective_resistance_dynamic_mask(
+                self.neighbor_list,
+                neighbor_mask,
+                weight,
+                root=self.root,
+                inv_method=self.inv_method,
+                epsilon=self.epsilon,
+                average_duplicates=self.average_duplicates,
+                backward_chunk_size=self.backward_chunk_size,
+            )
+
+        if self.neighbor_mask is not None and self.neighbor_mask.dim() == 3:
+            return _multi_graph_effective_resistance_dynamic_mask(
+                self.neighbor_list,
+                self.neighbor_mask,
+                weight,
+                root=self.root,
+                inv_method=self.inv_method,
+                epsilon=self.epsilon,
+                average_duplicates=self.average_duplicates,
+                backward_chunk_size=self.backward_chunk_size,
+            )
+
+        if not self._has_static_mapping:
+            raise ValueError(
+                "neighbor_mask must be passed to forward when no static mapping was "
+                "created in __init__."
+            )
+
         if self.shared_neighbor_list:
             mapping = _mapping_from_buffers(self, "shared")
             return _multi_graph_effective_resistance_with_mapping(

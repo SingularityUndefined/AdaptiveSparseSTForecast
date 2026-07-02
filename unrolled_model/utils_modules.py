@@ -1,16 +1,16 @@
 """Basic modules for unrolled optimization models."""
 
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-TensorOperator = Callable[[torch.Tensor], torch.Tensor]
+TensorOperator = Callable[..., torch.Tensor]
 
 
-def _identity(x: torch.Tensor) -> torch.Tensor:
+def _identity(x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
     return x
 
 
@@ -97,7 +97,9 @@ class UnrolledCG(nn.Module):
     """Learned, fixed-depth preconditioned conjugate-gradient update.
 
     ``B_vecs`` must have shape ``(batch_size, num_heads, num_nodes)``.
-    ``A_func`` and ``Minv_func`` must preserve this shape.
+    ``A_func`` and ``Minv_func``/``M_func`` must preserve this shape.  Extra
+    operator arguments can be passed through ``A_args``/``A_kwargs`` and
+    ``Minv_args``/``Minv_kwargs`` or ``M_args``/``M_kwargs``.
     """
 
     def __init__(
@@ -179,8 +181,12 @@ class UnrolledCG(nn.Module):
         operator: TensorOperator,
         signal: torch.Tensor,
         operator_name: str,
+        operator_args: Tuple[Any, ...] = (),
+        operator_kwargs: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
-        output = operator(signal)
+        if operator_kwargs is None:
+            operator_kwargs = {}
+        output = operator(signal, *operator_args, **operator_kwargs)
         if output.shape != signal.shape:
             raise ValueError(
                 f"{operator_name} must return a tensor with the same shape as input: "
@@ -201,25 +207,65 @@ class UnrolledCG(nn.Module):
         B_vecs: torch.Tensor,
         Minv_func: Optional[TensorOperator] = None,
         X0: Optional[torch.Tensor] = None,
+        *,
+        A_args: Tuple[Any, ...] = (),
+        A_kwargs: Optional[Dict[str, Any]] = None,
+        Minv_args: Tuple[Any, ...] = (),
+        Minv_kwargs: Optional[Dict[str, Any]] = None,
+        M_func: Optional[TensorOperator] = None,
+        M_args: Optional[Tuple[Any, ...]] = None,
+        M_kwargs: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         self._validate_signal_shape(B_vecs, "B_vecs")
         if X0 is not None and X0.shape != B_vecs.shape:
             raise ValueError("X0 must have the same shape as B_vecs.")
+        if Minv_func is not None and M_func is not None:
+            raise ValueError("Pass only one of Minv_func or M_func.")
+        if M_func is not None:
+            Minv_func = M_func
+            Minv_args = () if M_args is None else M_args
+            Minv_kwargs = M_kwargs
+        elif M_args is not None or M_kwargs is not None:
+            raise ValueError("M_args and M_kwargs require M_func.")
 
         preconditioner = Minv_func if Minv_func is not None else _identity
         x = torch.zeros_like(B_vecs) if X0 is None else X0.clone()
 
-        residual = B_vecs - self._apply_operator(A_func, x, "A_func")
-        direction = self._apply_operator(preconditioner, residual, "Minv_func")
+        residual = B_vecs - self._apply_operator(
+            A_func,
+            x,
+            "A_func",
+            A_args,
+            A_kwargs,
+        )
+        direction = self._apply_operator(
+            preconditioner,
+            residual,
+            "Minv_func",
+            Minv_args,
+            Minv_kwargs,
+        )
 
         for alpha, beta in zip(self.alpha, self.beta):
             alpha = self._step_parameter(alpha, direction)
             beta = self._step_parameter(beta, direction)
-            A_direction = self._apply_operator(A_func, direction, "A_func")
+            A_direction = self._apply_operator(
+                A_func,
+                direction,
+                "A_func",
+                A_args,
+                A_kwargs,
+            )
             x = x + alpha * direction
             residual = residual - alpha * A_direction
             direction = (
-                self._apply_operator(preconditioner, residual, "Minv_func")
+                self._apply_operator(
+                    preconditioner,
+                    residual,
+                    "Minv_func",
+                    Minv_args,
+                    Minv_kwargs,
+                )
                 + beta * direction
             )
 
