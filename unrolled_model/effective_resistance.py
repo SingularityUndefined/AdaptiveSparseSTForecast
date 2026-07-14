@@ -176,8 +176,7 @@ def build_neighbor_to_edge_map(
 
     flat_neighbor = neighbor_cpu.reshape(-1)
     flat_rows = torch.arange(num_nodes, dtype=torch.long).repeat_interleave(width)
-    valid = mask_cpu.reshape(-1)
-    valid &= flat_neighbor != flat_rows
+    valid = mask_cpu.reshape(-1) & (flat_neighbor != flat_rows)
     valid_flat_index = valid.nonzero(as_tuple=False).flatten()
     if valid_flat_index.numel() == 0:
         return NeighborToEdgeMap(
@@ -1054,4 +1053,4 @@ def _demo(device: torch.device) -> None:
 if __name__ == "__main__":
     _demo(torch.device("cpu"))
     if torch.cuda.is_available():
-        _demo(torch.device("cuda:1"))
+        _demo(torch.device("cuda:0"))

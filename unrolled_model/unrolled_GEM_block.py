@@ -58,8 +58,9 @@ class UnrolledGEMBlock(nn.Module):
         batch_size, num_heads, num_nodes = x.size()
         k = input_S.size(2)  # Number of neighbors
 
+        mask = input_S.to(device=x.device, dtype=x.dtype)
         edge_diffs = x.unsqueeze(-1) - x[:, :, self.neighbor_list.view(-1)].reshape(batch_size, num_heads, num_nodes, -1)  # Shape: (batch_size, num_heads, num_nodes, k)
-        edge_diffs = edge_diffs * input_S.unsqueeze(0)  # Apply neighbor mask
+        edge_diffs = edge_diffs * mask.unsqueeze(0)  # Apply neighbor mask
         return (edge_diffs ** 2).mean(dim=0)  # Shape: (num_heads, num_nodes, k)
         
     def apply_L(self, x, W, S):
@@ -75,8 +76,9 @@ class UnrolledGEMBlock(nn.Module):
         # compute edge differences
         batch_size, num_heads, num_nodes = x.size()
         k = S.size(2)  # Number of neighbors
+        mask = S.to(device=x.device, dtype=x.dtype)
         edge_diffs = x.unsqueeze(-1) - x[:, :, self.neighbor_list.view(-1)].reshape(batch_size, num_heads, num_nodes, -1)  # Shape: (batch_size, num_heads, num_nodes, k)
-        edge_diffs = edge_diffs * S.unsqueeze(0)  # Apply connectivity mask
+        edge_diffs = edge_diffs * mask.unsqueeze(0)  # Apply connectivity mask
         # compute weighted sum of edge differences
         weighted_edge_diffs = edge_diffs * W.unsqueeze(0)  # Shape: (batch_size, num_heads, num_nodes, k)
         Lx = weighted_edge_diffs.sum(dim=-1)  # Sum over neighbors, shape: (batch_size, num_heads, num_nodes)
