@@ -1,7 +1,37 @@
 import torch
 import torch.nn as nn
 from effective_resistance import MultiGraphEffectiveResistance
+from effective_resistance_torch import TorchDenseMultiGraphEffectiveResistance
 from utils_modules import UnrolledCG, GraphLearningModule, SparseGraphOperators
+
+
+def _build_effective_resistance_solver(
+    backend,
+    neighbor_list,
+    input_neighbor_mask,
+    epsilon,
+    backward_chunk_size,
+):
+    if backend == "sksparse":
+        return MultiGraphEffectiveResistance(
+            neighbor_list,
+            inv_method="L+J",
+            epsilon=epsilon,
+            backward_chunk_size=backward_chunk_size,
+        )
+    if backend == "torch_dense":
+        if input_neighbor_mask is None:
+            raise ValueError("torch_dense ER backend requires input_neighbor_mask.")
+        return TorchDenseMultiGraphEffectiveResistance(
+            neighbor_list,
+            input_neighbor_mask,
+            shared_neighbor_list=True,
+            inv_method="L+J",
+            epsilon=epsilon,
+            backward_chunk_size=backward_chunk_size,
+        )
+    raise ValueError("er_backend must be 'sksparse' or 'torch_dense'.")
+
 
 class UnrolledGEMBlock(nn.Module):
     '''
@@ -18,13 +48,14 @@ class UnrolledGEMBlock(nn.Module):
     Shape of input S: (num_graphs, num_nodes, k)
     Shape of neighbor list: (num_nodes, k) (possible neighbors are pre-defined)
     '''
-    def __init__(self, num_nodes, neighbor_list, num_heads, E_iters=5, M_iters=5, GD_step_init=0.1, mu_init=0.2, gamma_init=0.4, c=20, scale=True, epsilon=0.2, xi=1):
+    def __init__(self, num_nodes, neighbor_list, num_heads, E_iters=5, M_iters=5, GD_step_init=0.1, mu_init=0.2, gamma_init=0.4, c=20, scale=True, epsilon=0.2, xi=1, input_neighbor_mask=None, er_backend="sksparse", er_backward_chunk_size=1024):
         super(UnrolledGEMBlock, self).__init__()
         self.num_nodes = num_nodes
         self.neighbor_list = neighbor_list
         self.num_heads = num_heads
         self.E_iters = E_iters
         self.M_iters = M_iters
+        self.er_backend = er_backend
 
         # E-step block: Unrolled Conjugate Gradient for solving smoothness problem
         self.CG_solver = UnrolledCG(self.E_iters, 0.1, 0, self.num_heads, init_method='uniform', init_scale=0.02)
@@ -42,8 +73,14 @@ class UnrolledGEMBlock(nn.Module):
         self.gamma_list = nn.Parameter(torch.ones(self.M_iters) * gamma_init, requires_grad=True)
         self.step_size_list = nn.Parameter(torch.ones(self.M_iters) * GD_step_init, requires_grad=True)
 
-        # Reusable block for computing effective resistance without parameters
-        self.ER_solver = MultiGraphEffectiveResistance(self.neighbor_list, inv_method="L+J", epsilon=self.epsilon) # reusable block for pure computation without parameters
+        # Reusable block for computing effective resistance without parameters.
+        self.ER_solver = _build_effective_resistance_solver(
+            self.er_backend,
+            self.neighbor_list,
+            input_neighbor_mask,
+            self.epsilon,
+            er_backward_chunk_size,
+        )
 
         # Graph Operator block
         # self.graph_op = SparseGraphOperators(self.num_nodes, self.neighbor_list, self.input_S, c=self.c, scale=self.scale, epsilon=self.epsilon)
