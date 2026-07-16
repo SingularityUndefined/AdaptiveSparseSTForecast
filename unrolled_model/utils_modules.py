@@ -96,7 +96,8 @@ def _validate_operator_neighbor_inputs(
 class UnrolledCG(nn.Module):
     """Learned, fixed-depth preconditioned conjugate-gradient update.
 
-    ``B_vecs`` must have shape ``(batch_size, num_heads, num_nodes)``.
+    ``B_vecs`` must have shape ``(batch_size, num_heads, num_nodes)`` or
+    ``(batch_size, num_data, num_heads, num_nodes)``.
     ``A_func`` and ``Minv_func``/``M_func`` must preserve this shape.  Extra
     operator arguments can be passed through ``A_args``/``A_kwargs`` and
     ``Minv_args``/``Minv_kwargs`` or ``M_args``/``M_kwargs``.
@@ -170,10 +171,11 @@ class UnrolledCG(nn.Module):
             parameter.add_(center)
 
     def _validate_signal_shape(self, signal: torch.Tensor, name: str) -> None:
-        if signal.dim() != 3 or signal.size(1) != self.num_heads:
+        if signal.dim() not in (3, 4) or signal.size(-2) != self.num_heads:
             raise ValueError(
                 f"{name} must have shape (batch_size, num_heads, num_nodes) "
-                f"with num_heads={self.num_heads}."
+                "or (batch_size, num_data, num_heads, num_nodes) "
+                f"with num_heads={self.num_heads} on the second-to-last axis."
             )
 
     def _apply_operator(
@@ -199,6 +201,8 @@ class UnrolledCG(nn.Module):
         parameter: torch.Tensor,
         signal: torch.Tensor,
     ) -> torch.Tensor:
+        if signal.dim() == 4:
+            return parameter.view(1, 1, parameter.size(0), 1)
         return parameter.view(1, parameter.size(0), 1)
 
     def forward(
@@ -349,23 +353,57 @@ class GraphLearningModule(nn.Module):
     def _validate_neighbor_mask(
         self,
         neighbor_mask: torch.Tensor,
+        batch_size: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         neighbor_mask = torch.as_tensor(
             neighbor_mask,
             dtype=torch.bool,
             device=self.neighbor_list.device,
         )
-        _, neighbor_mask, safe_neighbor_list = _validate_operator_neighbor_inputs(
-            self.neighbor_list,
-            neighbor_mask,
-            self.num_nodes,
-        )
-        if int(neighbor_mask.size(0)) != self.num_graphs:
+
+        if neighbor_mask.dim() == 3:
+            _, neighbor_mask, safe_neighbor_list = _validate_operator_neighbor_inputs(
+                self.neighbor_list,
+                neighbor_mask,
+                self.num_nodes,
+            )
+            if int(neighbor_mask.size(0)) != self.num_graphs:
+                raise ValueError(
+                    "neighbor_mask must have shape "
+                    f"({self.num_graphs}, {self.num_nodes}, {self.num_neighbors})."
+                )
+            neighbor_mask = neighbor_mask.unsqueeze(0).expand(
+                batch_size,
+                -1,
+                -1,
+                -1,
+            )
+            return neighbor_mask, safe_neighbor_list
+
+        if (
+            neighbor_mask.dim() != 4
+            or neighbor_mask.size(0) != batch_size
+            or neighbor_mask.size(1) != self.num_graphs
+            or neighbor_mask.size(2) != self.num_nodes
+            or neighbor_mask.size(3) != self.num_neighbors
+        ):
             raise ValueError(
                 "neighbor_mask must have shape "
-                f"({self.num_graphs}, {self.num_nodes}, {self.num_neighbors})."
+                f"({self.num_graphs}, {self.num_nodes}, {self.num_neighbors}) or "
+                f"({batch_size}, {self.num_graphs}, {self.num_nodes}, "
+                f"{self.num_neighbors})."
             )
 
+        flat_neighbor_mask = neighbor_mask.reshape(
+            batch_size * self.num_graphs,
+            self.num_nodes,
+            self.num_neighbors,
+        )
+        _, _, safe_neighbor_list = _validate_operator_neighbor_inputs(
+            self.neighbor_list,
+            flat_neighbor_mask,
+            self.num_nodes,
+        )
         return neighbor_mask, safe_neighbor_list
 
     def forward(
@@ -375,15 +413,25 @@ class GraphLearningModule(nn.Module):
     ) -> torch.Tensor:
         """Generate graph weights from node values.
 
-        ``x`` must have shape ``(batch_size, num_graphs, num_nodes)``.
+        ``x`` must have shape
+        ``(batch_size, num_data, num_graphs, num_nodes)``.
         ``neighbor_mask`` must have shape
-        ``(num_graphs, num_nodes, num_neighbors)``.
+        ``(num_graphs, num_nodes, num_neighbors)`` or
+        ``(batch_size, num_graphs, num_nodes, num_neighbors)``.
         """
-        if x.dim() != 3 or x.size(1) != self.num_graphs or x.size(2) != self.num_nodes:
+        if (
+            x.dim() != 4
+            or x.size(2) != self.num_graphs
+            or x.size(3) != self.num_nodes
+        ):
             raise ValueError(
-                "x must have shape (batch_size, num_graphs, num_nodes)."
+                "x must have shape "
+                "(batch_size, num_data, num_graphs, num_nodes)."
             )
-        neighbor_mask, safe_neighbor_list = self._validate_neighbor_mask(neighbor_mask)
+        neighbor_mask, safe_neighbor_list = self._validate_neighbor_mask(
+            neighbor_mask,
+            int(x.size(0)),
+        )
         return self._forward_multi_graph(x, neighbor_mask, safe_neighbor_list)
 
     def _forward_multi_graph(
@@ -392,18 +440,25 @@ class GraphLearningModule(nn.Module):
         neighbor_mask: torch.Tensor,
         safe_neighbor_list: torch.Tensor,
     ) -> torch.Tensor:
-        batch_size, num_graphs, _ = x.shape
-        node_embeddings = self.node_embeddings.unsqueeze(0).expand(
+        batch_size, num_data, num_graphs, _ = x.shape
+        node_embeddings = self.node_embeddings.view(
+            1,
+            1,
+            self.num_graphs,
+            self.num_nodes,
+            self.emb_dim,
+        ).expand(
             batch_size,
+            num_data,
             -1,
             -1,
             -1,
         )
         node_input = torch.cat([x.unsqueeze(-1), node_embeddings], dim=-1)
         features = self.leakyrelu(self.fc(node_input))
-        features_by_graph = features.permute(1, 0, 2, 3).contiguous()
+        features_by_graph = features.permute(0, 2, 1, 3, 4).contiguous()
         flat_features = features_by_graph.reshape(
-            num_graphs * batch_size,
+            batch_size * num_graphs * num_data,
             self.num_nodes,
             self.feature_dim,
         )
@@ -411,21 +466,23 @@ class GraphLearningModule(nn.Module):
             :,
             safe_neighbor_list.to(device=flat_features.device).reshape(-1),
         ].reshape(
-            num_graphs,
             batch_size,
+            num_graphs,
+            num_data,
             self.num_nodes,
             self.num_neighbors,
             self.feature_dim,
         )
-        edge_diff = features_by_graph.unsqueeze(3) - neighbor_features
+        edge_diff = features_by_graph.unsqueeze(4) - neighbor_features
 
         theta = self.theta.to(device=x.device, dtype=features.dtype).view(
+            1,
             num_graphs,
             1,
             1,
             1,
         )
-        w = torch.exp(-(edge_diff.square()).sum(dim=-1) / (2.0 * theta)).mean(dim=1)
+        w = torch.exp(-(edge_diff.square()).sum(dim=-1) / (2.0 * theta)).mean(dim=2)
         if not torch.isfinite(w).all():
             raise ValueError("Non-finite values detected in learned graph weights.")
 
@@ -476,15 +533,39 @@ class SparseGraphOperators(nn.Module):
     def _validate_neighbor_mask(
         self,
         neighbor_mask: torch.Tensor,
+        batch_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         neighbor_mask = torch.as_tensor(
             neighbor_mask,
             dtype=torch.bool,
             device=self.neighbor_list.device,
         )
-        _, neighbor_mask, safe_neighbor_list = _validate_operator_neighbor_inputs(
+        if neighbor_mask.dim() == 3:
+            _, neighbor_mask, safe_neighbor_list = _validate_operator_neighbor_inputs(
+                self.neighbor_list,
+                neighbor_mask,
+                self.num_nodes,
+            )
+            if batch_size is not None:
+                neighbor_mask = neighbor_mask.unsqueeze(0).expand(batch_size, -1, -1, -1)
+            return neighbor_mask, safe_neighbor_list
+
+        if neighbor_mask.dim() != 4:
+            raise ValueError(
+                "neighbor_mask must have shape (num_graphs, num_nodes, "
+                "num_neighbors) or (batch_size, num_graphs, num_nodes, "
+                "num_neighbors)."
+            )
+        if batch_size is not None and neighbor_mask.size(0) != batch_size:
+            raise ValueError("neighbor_mask batch dimension does not match w.")
+        flat_neighbor_mask = neighbor_mask.reshape(
+            neighbor_mask.size(0) * neighbor_mask.size(1),
+            self.num_nodes,
+            self.num_neighbors,
+        )
+        _, _, safe_neighbor_list = _validate_operator_neighbor_inputs(
             self.neighbor_list,
-            neighbor_mask,
+            flat_neighbor_mask,
             self.num_nodes,
         )
         return neighbor_mask, safe_neighbor_list
@@ -494,19 +575,31 @@ class SparseGraphOperators(nn.Module):
         w: torch.Tensor,
         neighbor_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        neighbor_mask, safe_neighbor_list = self._validate_neighbor_mask(neighbor_mask)
-        if w.dim() != 3 or tuple(w.shape[1:]) != tuple(self.neighbor_list.shape):
+        if w.dim() != 4 or tuple(w.shape[2:]) != tuple(self.neighbor_list.shape):
             raise ValueError(
-                "w must have shape (num_graphs, num_nodes, num_neighbors)."
+                "w must have shape "
+                "(batch_size, num_graphs, num_nodes, num_neighbors)."
             )
-        if w.size(0) != neighbor_mask.size(0):
+        neighbor_mask, safe_neighbor_list = self._validate_neighbor_mask(
+            neighbor_mask,
+            batch_size=int(w.size(0)),
+        )
+        if w.size(1) != neighbor_mask.size(1):
             raise ValueError("w and neighbor_mask must agree on num_graphs.")
         mask = neighbor_mask.to(device=w.device, dtype=w.dtype)
         return w * mask, neighbor_mask, safe_neighbor_list
 
     def _validate_node_batch(self, X: torch.Tensor, w: torch.Tensor) -> None:
-        if X.dim() != 3 or X.size(1) != w.size(0) or X.size(2) != self.num_nodes:
-            raise ValueError("X must have shape (batch_size, num_graphs, num_nodes).")
+        if (
+            X.dim() != 4
+            or X.size(0) != w.size(0)
+            or X.size(2) != w.size(1)
+            or X.size(3) != self.num_nodes
+        ):
+            raise ValueError(
+                "X must have shape "
+                "(batch_size, num_data, num_graphs, num_nodes)."
+            )
 
     def scale_w(
         self,
@@ -519,12 +612,12 @@ class SparseGraphOperators(nn.Module):
             return w, w.new_ones(w.size(0))
 
         degree = w.sum(dim=-1)
-        laplacian_norm_square = degree.square().sum(dim=1) + w.square().sum(
-            dim=(1, 2)
+        laplacian_norm_square = degree.square().sum(dim=2) + w.square().sum(
+            dim=(2, 3)
         )
         norm = torch.sqrt(torch.clamp(laplacian_norm_square, min=self.norm_eps))
         scale_factor = self.c / norm
-        return w * scale_factor.view(-1, 1, 1), scale_factor
+        return w * scale_factor.unsqueeze(-1).unsqueeze(-1), scale_factor
 
     def apply_L(
         self,
@@ -535,30 +628,32 @@ class SparseGraphOperators(nn.Module):
         """Apply sparse graph Laplacian(s) to batched node signals.
 
         Args:
-            X: ``(batch_size, num_graphs, num_nodes)``.
-            w: ``(num_graphs, num_nodes, num_neighbors)``.
-            neighbor_mask: ``(num_graphs, num_nodes, num_neighbors)``.
+            X: ``(batch_size, num_data, num_graphs, num_nodes)``.
+            w: ``(batch_size, num_graphs, num_nodes, num_neighbors)``.
+            neighbor_mask: ``(num_graphs, num_nodes, num_neighbors)`` or
+                ``(batch_size, num_graphs, num_nodes, num_neighbors)``.
 
         Returns:
-            ``(batch_size, num_graphs, num_nodes)``.
+            ``(batch_size, num_data, num_graphs, num_nodes)``.
         """
         w, _, safe_neighbor_list = self._validate_weight(w, neighbor_mask)
         w = w.to(device=X.device, dtype=X.dtype)
         self._validate_node_batch(X, w)
         neighbor_index = safe_neighbor_list.to(device=X.device).reshape(-1)
 
-        batch_size, num_graphs, _ = X.shape
-        X_by_graph = X.permute(1, 0, 2).contiguous()
-        flat_X = X_by_graph.reshape(num_graphs * batch_size, self.num_nodes)
+        batch_size, num_data, num_graphs, _ = X.shape
+        X_by_graph = X.permute(0, 2, 1, 3).contiguous()
+        flat_X = X_by_graph.reshape(batch_size * num_graphs * num_data, self.num_nodes)
         neighbor_X = flat_X.index_select(1, neighbor_index).reshape(
-            num_graphs,
             batch_size,
+            num_graphs,
+            num_data,
             self.num_nodes,
             self.num_neighbors,
         )
-        edge_diff = X_by_graph.unsqueeze(3) - neighbor_X
-        output = (w.unsqueeze(1) * edge_diff).sum(dim=3)
-        return output.permute(1, 0, 2).contiguous()
+        edge_diff = X_by_graph.unsqueeze(4) - neighbor_X
+        output = (w.unsqueeze(2) * edge_diff).sum(dim=4)
+        return output.permute(0, 2, 1, 3).contiguous()
 
     def apply_L_plus_J(
         self,
@@ -591,6 +686,7 @@ def _demo_multi_head_unrolled_cg() -> None:
 
     num_heads = 3
     batch_size = 4
+    num_data = 5
     num_nodes = 6
     num_neighbors = 6
     mu = 0.1
@@ -627,7 +723,7 @@ def _demo_multi_head_unrolled_cg() -> None:
     assert all(torch.unique(row_degrees[head]).numel() > 1 for head in range(num_heads))
     assert not neighbor_mask[..., -1].any()
 
-    x = torch.randn(batch_size, num_heads, num_nodes)
+    x = torch.randn(batch_size, num_data, num_heads, num_nodes)
     graph_learner = GraphLearningModule(
         num_nodes,
         num_heads,
@@ -648,13 +744,13 @@ def _demo_multi_head_unrolled_cg() -> None:
     LJx = graph_ops.apply_L_plus_J(x, w, neighbor_mask)
     Lepsx = graph_ops.apply_L_plus_epsilon_I(x, w, neighbor_mask, epsilon=0.05)
 
-    assert w_raw.shape == (num_heads, num_nodes, num_neighbors)
-    assert w.shape == (num_heads, num_nodes, num_neighbors)
-    assert scale.shape == (num_heads,)
+    assert w_raw.shape == (batch_size, num_heads, num_nodes, num_neighbors)
+    assert w.shape == (batch_size, num_heads, num_nodes, num_neighbors)
+    assert scale.shape == (batch_size, num_heads)
     assert Lx.shape == x.shape
     assert LJx.shape == x.shape
     assert Lepsx.shape == x.shape
-    assert torch.all(w[~neighbor_mask] == 0)
+    assert torch.all(w[~neighbor_mask.unsqueeze(0).expand_as(w)] == 0)
     assert torch.allclose(LJx, Lx + x.mean(dim=-1, keepdim=True).expand_as(x))
     assert torch.allclose(Lepsx, Lx + 0.05 * x)
 
@@ -668,8 +764,8 @@ def _demo_multi_head_unrolled_cg() -> None:
         num_heads=num_heads,
     )
     z = solver(lhs, x)
-    initial_residual = (lhs(torch.zeros_like(x)) - x).norm(dim=(0, 2))
-    final_residual = (lhs(z) - x).norm(dim=(0, 2))
+    initial_residual = (lhs(torch.zeros_like(x)) - x).norm(dim=(1, 3))
+    final_residual = (lhs(z) - x).norm(dim=(1, 3))
 
     print("neighbor_list shape:", tuple(neighbor_list.shape))
     print("neighbor_list", neighbor_list)

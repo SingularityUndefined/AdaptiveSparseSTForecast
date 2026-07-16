@@ -19,9 +19,10 @@ class UnrolledGEM(nn.Module):
 
     Solve with multi-head graph learning.
     
-    Shape of input y: (batch_size, num_nodes)
-    Shape of input W^o: (num_graphs, num_nodes, k)
-    Shape of input S: (num_graphs, num_nodes, k)
+    Shape of public input y: (batch_size, num_data, num_nodes)
+    Internal y/x shape after head expansion: (batch_size, num_data, num_heads, num_nodes)
+    Shape of input W^o: (batch_size, num_heads, num_nodes, k)
+    Shape of input S: (batch_size, num_heads, num_nodes, k)
     Shape of neighbor list: (num_nodes, k) (possible neighbors are pre-defined)
     '''
     def __init__(self, num_nodes, neighbor_list, input_neighbor_mask, num_heads, num_blocks, E_iters, M_iters, GD_step_init=0.1, mu_init=0.2, gamma_init=0.4, c=20, scale=True, epsilon=0.2, alpha_init=0.5, er_backend="sksparse", er_backward_chunk_size=1024):
@@ -76,67 +77,121 @@ class UnrolledGEM(nn.Module):
         Forward pass of the Unrolled GEM module.
         
         Args:
-            y: input signal, shape (batch_size, num_nodes)
-            W_o: initial graph weights, shape (num_graphs, num_nodes, k)
+            y: input signal, public shape (B, n_data, n_nodes). If a
+                pre-expanded internal tensor is passed, (B, n_data, n_head, n_nodes)
+                is also accepted.
+            W_o: initial graph weights, shape (B, n_head, n_nodes, k)
         
         Returns:
-            x: output signal after E-step and M-step, shape (batch_size, num_nodes)
-            W: updated graph weights after M-step, shape (num_graphs, num_nodes, k)
-            S: updated connectivity mask after M-step, shape (num_graphs, num_nodes, k)
+            x: output signal after E-step and M-step, shape (B, n_data, n_head, n_nodes)
+            W: updated graph weights after M-step, shape (B, n_head, n_nodes, k)
+            S: updated connectivity mask after M-step, shape (B, n_head, n_nodes, k)
         '''
         # TODO: other initial recovery of x from y, e.g., x = y, or x = (I + mu L)^-1 y, or parameterized, etc.
+        y = self._ensure_signal_shape(y)
+        W_o = self._ensure_graph_shape(W_o, y.size(0), "W_o")
         x = y
-        S = self.input_S
+        S = self._expand_input_S(y.size(0))
         W_old = None
         for i in range(self.num_blocks):
-            if x.ndim == 2:
-                x_for_glm = x.unsqueeze(1).repeat(1, self.num_heads, 1)
-            else:
-                x_for_glm = x
-
             if W_old is not None:
-                W = self.GLM_list[i](x_for_glm, S) * self.alpha_list[i] + W_old * (1 - self.alpha_list[i])  # Weighted combination of learned graph and previous graph
+                W = self.GLM_list[i](x, S) * self.alpha_list[i] + W_old * (1 - self.alpha_list[i])  # Weighted combination of learned graph and previous graph
             else:
-                W = self.GLM_list[i](x_for_glm, S)
+                W = self.GLM_list[i](x, S)
             
             x, W, S = self.GEM_block_list[i](y, W, S)
             W_old = W
 
         return x, W, S
 
+    def _ensure_signal_shape(self, y):
+        if y.ndim == 2:
+            y = y.unsqueeze(1).unsqueeze(2).expand(-1, 1, self.num_heads, -1)
+        elif y.ndim == 3:
+            y = y.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
+        elif y.ndim != 4:
+            raise ValueError(
+                "public input y must have shape (B, n_data, n_nodes) "
+                "or legacy shape (B, n_nodes); pre-expanded internal shape "
+                "(B, n_data, n_head, n_nodes) is also accepted."
+            )
+        if y.size(2) != self.num_heads or y.size(3) != self.num_nodes:
+            raise ValueError(
+                "expanded y must have shape (B, n_data, n_head, n_nodes) with "
+                f"n_head={self.num_heads} and n_nodes={self.num_nodes}; "
+                "public input y should normally be (B, n_data, n_nodes)."
+            )
+        return y
+
+    def _ensure_graph_shape(self, graph, batch_size, name):
+        if graph.ndim == 3:
+            graph = graph.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        if (
+            graph.ndim != 4
+            or graph.size(0) != batch_size
+            or graph.size(1) != self.num_heads
+            or graph.size(2) != self.num_nodes
+            or graph.size(3) != self.neighbor_list.size(1)
+        ):
+            raise ValueError(
+                f"{name} must have shape (B, n_head, n_nodes, k) with "
+                f"B={batch_size}, n_head={self.num_heads}, "
+                f"n_nodes={self.num_nodes}, k={self.neighbor_list.size(1)}; "
+                "legacy (n_head, n_nodes, k) inputs are expanded across B."
+            )
+        return graph
+
+    def _expand_input_S(self, batch_size):
+        return self.input_S.unsqueeze(0).expand(batch_size, -1, -1, -1)
+
+
+def _as_batched_graph_tensor(graph, batch_size=None):
+    if graph.dim() == 3:
+        if batch_size is None:
+            batch_size = 1
+        graph = graph.unsqueeze(0).expand(batch_size, -1, -1, -1)
+    if graph.dim() != 4:
+        raise ValueError("graph tensor must have shape (H, N, k) or (B, H, N, k).")
+    if batch_size is not None and graph.size(0) != batch_size:
+        raise ValueError("graph tensor batch dimension does not match.")
+    return graph
+
 
 def _summarize_block_sparsity(prefix, initial_S, previous_S, current_S):
+    batch_size = current_S.size(0) if current_S.dim() == 4 else None
+    current_S = _as_batched_graph_tensor(current_S, batch_size)
+    batch_size = current_S.size(0)
+    initial_S = _as_batched_graph_tensor(initial_S, batch_size)
+    previous_S = _as_batched_graph_tensor(previous_S, batch_size)
     initial = initial_S.bool()
     previous = previous_S.bool() & initial
     current = current_S.bool() & initial
-    initial_counts = initial.flatten(1).sum(dim=1)
-    previous_counts = previous.flatten(1).sum(dim=1)
-    current_counts = current.flatten(1).sum(dim=1)
+    initial_counts = initial.flatten(2).sum(dim=2)
+    previous_counts = previous.flatten(2).sum(dim=2)
+    current_counts = current.flatten(2).sum(dim=2)
 
     print(prefix)
-    for head_idx, (initial_count, previous_count, current_count) in enumerate(
-        zip(
-            initial_counts.tolist(),
-            previous_counts.tolist(),
-            current_counts.tolist(),
-        )
-    ):
-        cumulative_removed_count = initial_count - current_count
-        incremental_removed_count = previous_count - current_count
-        cumulative_sparsity = (
-            cumulative_removed_count / initial_count if initial_count else 0.0
-        )
-        incremental_sparsity = (
-            incremental_removed_count / previous_count if previous_count else 0.0
-        )
-        print(
-            f"  head {head_idx}: "
-            f"prev_edges={previous_count // 2}, "
-            f"remaining_edges={current_count // 2}, "
-            f"newly_removed_edges={incremental_removed_count // 2}, "
-            f"layer_sparsity={incremental_sparsity:.2%}, "
-            f"cumulative_sparsity={cumulative_sparsity:.2%}"
-        )
+    for batch_idx in range(batch_size):
+        for head_idx in range(current.size(1)):
+            initial_count = int(initial_counts[batch_idx, head_idx].item())
+            previous_count = int(previous_counts[batch_idx, head_idx].item())
+            current_count = int(current_counts[batch_idx, head_idx].item())
+            cumulative_removed_count = initial_count - current_count
+            incremental_removed_count = previous_count - current_count
+            cumulative_sparsity = (
+                cumulative_removed_count / initial_count if initial_count else 0.0
+            )
+            incremental_sparsity = (
+                incremental_removed_count / previous_count if previous_count else 0.0
+            )
+            print(
+                f"  batch {batch_idx}, head {head_idx}: "
+                f"prev_edges={previous_count // 2}, "
+                f"remaining_edges={current_count // 2}, "
+                f"newly_removed_edges={incremental_removed_count // 2}, "
+                f"layer_sparsity={incremental_sparsity:.2%}, "
+                f"cumulative_sparsity={cumulative_sparsity:.2%}"
+            )
 
 
 def _infer_square_grid_size(num_nodes):
@@ -147,25 +202,29 @@ def _infer_square_grid_size(num_nodes):
 
 
 def _print_node_degree_changes(prefix, previous_S, current_S, grid_size=None):
+    batch_size = current_S.size(0) if current_S.dim() == 4 else None
+    current_S = _as_batched_graph_tensor(current_S, batch_size)
+    previous_S = _as_batched_graph_tensor(previous_S, current_S.size(0))
     current_degree = current_S.bool().sum(dim=-1).detach().cpu()
     previous_degree = previous_S.bool().sum(dim=-1).detach().cpu()
     degree_delta = current_degree - previous_degree
 
     print(f"{prefix} node topo degree changes:")
-    for head_idx in range(degree_delta.size(0)):
-        head_delta = degree_delta[head_idx]
-        print(
-            f"  head {head_idx}: "
-            f"delta min={int(head_delta.min().item())}, "
-            f"mean={head_delta.float().mean().item():.2f}, "
-            f"max={int(head_delta.max().item())}"
-        )
+    for batch_idx in range(degree_delta.size(0)):
+        for head_idx in range(degree_delta.size(1)):
+            head_delta = degree_delta[batch_idx, head_idx]
+            print(
+                f"  batch {batch_idx}, head {head_idx}: "
+                f"delta min={int(head_delta.min().item())}, "
+                f"mean={head_delta.float().mean().item():.2f}, "
+                f"max={int(head_delta.max().item())}"
+            )
 
-        if grid_size is not None and grid_size * grid_size == head_delta.numel():
-            print("  degree delta grid:")
-            print(head_delta.reshape(grid_size, grid_size))
-        else:
-            print("  degree delta per node:", head_delta)
+            if grid_size is not None and grid_size * grid_size == head_delta.numel():
+                print("  degree delta grid:")
+                print(head_delta.reshape(grid_size, grid_size))
+            else:
+                print("  degree delta per node:", head_delta)
 
 
 def _format_flops(flops):
@@ -331,25 +390,22 @@ def _load_reference_state(model, reference_state, er_backend):
 
 def _run_sparsity_trace(model, noisy_signal):
     model.train()
+    noisy_signal = model._ensure_signal_shape(noisy_signal)
     grid_size = _infer_square_grid_size(model.num_nodes)
+    input_S = model._expand_input_S(noisy_signal.size(0))
     _summarize_block_sparsity(
         "input candidate graph:",
-        model.input_S,
-        model.input_S,
-        model.input_S,
+        input_S,
+        input_S,
+        input_S,
     )
 
     with torch.no_grad():
         x = noisy_signal
-        S = model.input_S
+        S = input_S
         W_old = None
         for block_idx in range(model.num_blocks):
-            if x.ndim == 2:
-                x_for_glm = x.unsqueeze(1).repeat(1, model.num_heads, 1)
-            else:
-                x_for_glm = x
-
-            W_learned = model.GLM_list[block_idx](x_for_glm, S)
+            W_learned = model.GLM_list[block_idx](x, S)
             if W_old is None:
                 W = W_learned
             else:
@@ -360,7 +416,7 @@ def _run_sparsity_trace(model, noisy_signal):
             x, W, S = model.GEM_block_list[block_idx](noisy_signal, W, S)
             _summarize_block_sparsity(
                 f"after block {block_idx + 1:02d}:",
-                model.input_S,
+                input_S,
                 previous_S,
                 S,
             )
@@ -568,6 +624,7 @@ def _demo_block_sparsity(device_name="cuda:0") -> None:
 
     grid_size = 10
     batch_size = 4
+    num_data = 3
     num_heads = 2
     num_blocks = 4
     num_nodes = grid_size * grid_size
@@ -575,9 +632,18 @@ def _demo_block_sparsity(device_name="cuda:0") -> None:
     neighbor_list = neighbor_list.to(device)
     input_S = input_S.to(device)
 
-    clean_signal = _make_grid_signal(grid_size).to(device).repeat(batch_size, 1)
+    clean_signal = _make_grid_signal(grid_size).to(device).view(1, 1, -1).expand(
+        batch_size,
+        num_data,
+        -1,
+    )
     noisy_signal = clean_signal + 0.25 * torch.randn_like(clean_signal)
-    W_o = input_S.float()
+    W_o = input_S.repeat(num_heads, 1, 1).unsqueeze(0).expand(
+        batch_size,
+        -1,
+        -1,
+        -1,
+    ).float()
 
     model = _build_demo_model(
         num_nodes,
@@ -595,6 +661,7 @@ def _demo_block_sparsity(device_name="cuda:0") -> None:
     print(f"{grid_size}x{grid_size} grid UnrolledGEM sparsity demo")
     print("device:", device)
     print("batch size:", batch_size)
+    print("n_data:", num_data)
     print("neighbor_list shape:", tuple(neighbor_list.shape))
     print("input_S shape:", tuple(input_S.shape))
     print("clean signal shape:", tuple(clean_signal.shape))

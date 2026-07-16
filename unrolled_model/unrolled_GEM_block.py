@@ -43,9 +43,10 @@ class UnrolledGEMBlock(nn.Module):
 
     Solve with multi-head graph learning.
     
-    Shape of input y: (batch_size, num_nodes)
-    Shape of input W^o: (num_graphs, num_nodes, k)
-    Shape of input S: (num_graphs, num_nodes, k)
+    Shape of public input y: (batch_size, num_data, num_nodes)
+    Internal y/x shape after head expansion: (batch_size, num_data, num_heads, num_nodes)
+    Shape of input W^o: (batch_size, num_heads, num_nodes, k)
+    Shape of input S: (batch_size, num_heads, num_nodes, k)
     Shape of neighbor list: (num_nodes, k) (possible neighbors are pre-defined)
     '''
     def __init__(self, num_nodes, neighbor_list, num_heads, E_iters=5, M_iters=5, GD_step_init=0.1, mu_init=0.2, gamma_init=0.4, c=20, scale=True, epsilon=0.2, xi=1, input_neighbor_mask=None, er_backend="sksparse", er_backward_chunk_size=1024):
@@ -88,37 +89,44 @@ class UnrolledGEMBlock(nn.Module):
     def edge_diff_square(self, x, input_S):
         """
         Compute the squared differences of node features across edges defined by the neighbor mask.
-        x: Node features of shape (batch_size, num_heads, num_nodes)
-        input_S: Neighbor mask of shape (num_heads, num_nodes, k)
-        Returns: Squared differences of shape (num_heads, num_nodes, k)
+        x: Node features of shape (batch_size, num_data, num_heads, num_nodes)
+        input_S: Neighbor mask of shape (batch_size, num_heads, num_nodes, k)
+        Returns: Squared differences of shape (batch_size, num_heads, num_nodes, k)
         """
-        batch_size, num_heads, num_nodes = x.size()
-        k = input_S.size(2)  # Number of neighbors
-
+        batch_size, num_data, num_heads, num_nodes = x.size()
         mask = input_S.to(device=x.device, dtype=x.dtype)
-        edge_diffs = x.unsqueeze(-1) - x[:, :, self.neighbor_list.view(-1)].reshape(batch_size, num_heads, num_nodes, -1)  # Shape: (batch_size, num_heads, num_nodes, k)
-        edge_diffs = edge_diffs * mask.unsqueeze(0)  # Apply neighbor mask
-        return (edge_diffs ** 2).mean(dim=0)  # Shape: (num_heads, num_nodes, k)
+        safe_neighbor_list = self.neighbor_list.to(device=x.device).clamp_min(0)
+        neighbor_x = x.index_select(
+            -1,
+            safe_neighbor_list.reshape(-1),
+        ).reshape(batch_size, num_data, num_heads, num_nodes, -1)
+        edge_diffs = x.unsqueeze(-1) - neighbor_x  # Shape: (B, n_data, H, N, k)
+        edge_diffs = edge_diffs * mask.unsqueeze(1)  # Apply neighbor mask
+        return (edge_diffs ** 2).mean(dim=1)  # Shape: (B, H, N, k)
         
     def apply_L(self, x, W, S):
         """
         Sparse implementation of graph Laplacian operator L applied to x, given graph weights W and connectivity mask S.
         input:
-            x: Node features of shape (batch_size, num_heads, num_nodes)
-            W: Graph weights of shape (num_heads, num_nodes, k)
-            S: Connectivity mask of shape (num_heads, num_nodes, k)
+            x: Node features of shape (batch_size, num_data, num_heads, num_nodes)
+            W: Graph weights of shape (batch_size, num_heads, num_nodes, k)
+            S: Connectivity mask of shape (batch_size, num_heads, num_nodes, k)
         output:
-            Lx: Graph Laplacian applied to x, of shape (batch_size, num_heads, num_nodes)
+            Lx: Graph Laplacian applied to x, of shape (batch_size, num_data, num_heads, num_nodes)
         """
         # compute edge differences
-        batch_size, num_heads, num_nodes = x.size()
-        k = S.size(2)  # Number of neighbors
+        batch_size, num_data, num_heads, num_nodes = x.size()
         mask = S.to(device=x.device, dtype=x.dtype)
-        edge_diffs = x.unsqueeze(-1) - x[:, :, self.neighbor_list.view(-1)].reshape(batch_size, num_heads, num_nodes, -1)  # Shape: (batch_size, num_heads, num_nodes, k)
-        edge_diffs = edge_diffs * mask.unsqueeze(0)  # Apply connectivity mask
+        safe_neighbor_list = self.neighbor_list.to(device=x.device).clamp_min(0)
+        neighbor_x = x.index_select(
+            -1,
+            safe_neighbor_list.reshape(-1),
+        ).reshape(batch_size, num_data, num_heads, num_nodes, -1)
+        edge_diffs = x.unsqueeze(-1) - neighbor_x  # Shape: (B, n_data, H, N, k)
+        edge_diffs = edge_diffs * mask.unsqueeze(1)  # Apply connectivity mask
         # compute weighted sum of edge differences
-        weighted_edge_diffs = edge_diffs * W.unsqueeze(0)  # Shape: (batch_size, num_heads, num_nodes, k)
-        Lx = weighted_edge_diffs.sum(dim=-1)  # Sum over neighbors, shape: (batch_size, num_heads, num_nodes)
+        weighted_edge_diffs = edge_diffs * W.unsqueeze(1)  # Shape: (B, n_data, H, N, k)
+        Lx = weighted_edge_diffs.sum(dim=-1)  # Sum over neighbors, shape: (B, n_data, H, N)
         return Lx
     
     ###### NOT USED ##################
@@ -126,11 +134,11 @@ class UnrolledGEMBlock(nn.Module):
         """
         Sparse implementation of (L + epsilon * I) applied to x, given graph weights W and connectivity mask S.
         input:
-            x: Node features of shape (batch_size, num_heads, num_nodes)
-            W: Graph weights of shape (num_heads, num_nodes, k)
-            S: Connectivity mask of shape (num_heads, num_nodes, k)
+            x: Node features of shape (batch_size, num_data, num_heads, num_nodes)
+            W: Graph weights of shape (batch_size, num_heads, num_nodes, k)
+            S: Connectivity mask of shape (batch_size, num_heads, num_nodes, k)
         output:
-            (L + epsilon * I)x: Graph Laplacian plus epsilon times identity applied to x, of shape (batch_size, num_heads, num_nodes)
+            (L + epsilon * I)x: Graph Laplacian plus epsilon times identity applied to x, of shape (batch_size, num_data, num_heads, num_nodes)
         """
         Lx = self.apply_L(x, W, S)  # Apply graph Laplacian
         return Lx + self.epsilon * x  # Add epsilon * I * x 
@@ -141,16 +149,61 @@ class UnrolledGEMBlock(nn.Module):
         Scale the graph weights W to meet the F-norm constraints of self.c
         """
         # Compute the Frobenius norm of W considering only the edges defined by S
-        fro_norm = torch.sqrt((W * S).pow(2).sum(dim=(1, 2)))  # Shape: (num_heads,)
+        fro_norm = torch.sqrt((W * S).pow(2).sum(dim=(2, 3)))  # Shape: (B, num_heads)
         # Compute scaling factors to meet the constraint
-        scale_factors = self.c / (fro_norm + 1e-8)  # Shape: (num_heads,)
+        scale_factors = self.c / (fro_norm + 1e-8)  # Shape: (B, num_heads)
         # Scale W accordingly
-        W_scaled = W * scale_factors.view(-1, 1, 1)  # Shape: (num_heads, num_nodes, k)
+        W_scaled = W * scale_factors.unsqueeze(-1).unsqueeze(-1)  # Shape: (B, H, N, k)
         return W_scaled
 
-    def E_step(self, y, W, S):
+    def _ensure_signal_shape(self, y):
         if y.ndim == 2:
-            y = y.unsqueeze(1).repeat(1, self.num_heads, 1) # (batch_size, num_nodes) -> (batch_size, num_heads, num_nodes)
+            y = y.unsqueeze(1).unsqueeze(2).expand(-1, 1, self.num_heads, -1)
+        elif y.ndim == 3:
+            y = y.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
+        elif y.ndim != 4:
+            raise ValueError(
+                "public input y must have shape (B, n_data, n_nodes) "
+                "or legacy shape (B, n_nodes); pre-expanded internal shape "
+                "(B, n_data, n_head, n_nodes) is also accepted."
+            )
+        if y.size(2) != self.num_heads or y.size(3) != self.num_nodes:
+            raise ValueError(
+                "expanded y must have shape (B, n_data, n_head, n_nodes) with "
+                f"n_head={self.num_heads} and n_nodes={self.num_nodes}; "
+                "public input y should normally be (B, n_data, n_nodes)."
+            )
+        return y
+
+    def _ensure_graph_shape(self, graph, batch_size, name):
+        if graph.ndim == 3:
+            graph = graph.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        if (
+            graph.ndim != 4
+            or graph.size(0) != batch_size
+            or graph.size(1) != self.num_heads
+            or graph.size(2) != self.num_nodes
+            or graph.size(3) != self.neighbor_list.size(1)
+        ):
+            raise ValueError(
+                f"{name} must have shape (B, n_head, n_nodes, k) with "
+                f"B={batch_size}, n_head={self.num_heads}, "
+                f"n_nodes={self.num_nodes}, k={self.neighbor_list.size(1)}; "
+                "legacy (n_head, n_nodes, k) inputs are expanded across B."
+            )
+        return graph
+
+    def _er_solver(self, W, neighbor_mask):
+        batch_size, num_heads, num_nodes, num_neighbors = W.shape
+        flat_W = W.reshape(batch_size * num_heads, num_nodes, num_neighbors)
+        flat_mask = neighbor_mask.reshape(batch_size * num_heads, num_nodes, num_neighbors)
+        resistance = self.ER_solver(flat_W, flat_mask)
+        return resistance.reshape(batch_size, num_heads, num_nodes, num_neighbors)
+
+    def E_step(self, y, W, S):
+        y = self._ensure_signal_shape(y)
+        W = self._ensure_graph_shape(W, y.size(0), "W")
+        S = self._ensure_graph_shape(S, y.size(0), "S")
 
         def LHS(x):
             """
@@ -166,19 +219,19 @@ class UnrolledGEMBlock(nn.Module):
     def M_step(self, x, W, input_S):
         candidate_mask = input_S.bool()
         neighbor_mask = candidate_mask
-        x_diff_square = self.edge_diff_square(x, input_S)  # Shape: (num_heads, num_nodes, k)
+        x_diff_square = self.edge_diff_square(x, input_S)  # Shape: (B, num_heads, num_nodes, k)
         for i in range(self.M_iters):
             # Compute effective resistance for the current graph W
             assert W[~candidate_mask].abs().sum() == 0, "W has non-zero entries outside the candidate mask"
-            resistance = self.ER_solver(W, neighbor_mask)  # Shape: (num_heads, num_nodes, k)
+            resistance = self._er_solver(W, neighbor_mask)  # Shape: (B, num_heads, num_nodes, k)
             
             # TODO: check which epsilon to be used here, the one in ER_solver or the one in M_step
-            sparse_penalty = self.gamma_list[i] / (W + self.xi)  # Shape: (num_heads, num_nodes, k)
-            grad = x_diff_square + sparse_penalty - resistance  # Shape: (num_heads, num_nodes, k)
+            sparse_penalty = self.gamma_list[i] / (W + self.xi)  # Shape: (B, num_heads, num_nodes, k)
+            grad = x_diff_square + sparse_penalty - resistance  # Shape: (B, num_heads, num_nodes, k)
             grad = grad * neighbor_mask.to(dtype=grad.dtype, device=grad.device)  # Apply neighbor mask to gradient
 
             # gradient step
-            W = torch.clamp(W - self.step_size_list[i] * grad, min=0)  # Shape: (num_heads, num_nodes, k)
+            W = torch.clamp(W - self.step_size_list[i] * grad, min=0)  # Shape: (B, num_heads, num_nodes, k)
             W = W * candidate_mask.to(dtype=W.dtype, device=W.device)
             
             neighbor_mask = (W > 0) & candidate_mask  # Update active mask based on non-zero candidate weights
@@ -189,17 +242,25 @@ class UnrolledGEMBlock(nn.Module):
     
     def forward(self, y, W_o, input_S, default_threshold=1e-4):
         """
-        y: Node features of shape (batch_size, num_nodes, in_channels)
-        W_o: Initial graph weights of shape (num_heads, num_nodes, k)
-        input_S: Connectivity mask of shape (num_heads, num_nodes, k)
+        y: Node features of public shape (B, n_data, n_nodes). If a
+            pre-expanded internal tensor is passed, (B, n_data, n_head, n_nodes)
+            is also accepted.
+        W_o: Initial graph weights of shape (B, n_head, n_nodes, k)
+        input_S: Connectivity mask of shape (B, n_head, n_nodes, k)
         """
+        y = self._ensure_signal_shape(y)
         batch_size = y.size(0)
+        W_o = self._ensure_graph_shape(W_o, batch_size, "W_o")
+        input_S = self._ensure_graph_shape(input_S, batch_size, "input_S")
         # E-step: Solve for x given y and current graph W_o
-        x = self.E_step(y, W_o, input_S)  # Shape: (batch_size, num_heads, num_nodes)
+        x = self.E_step(y, W_o, input_S)  # Shape: (B, n_data, num_heads, num_nodes)
         # M-step: Update graph weights W given x and current graph W_o
-        W = self.M_step(x, W_o, input_S)  # Shape: (num_heads, num_nodes, k)
+        W = self.M_step(x, W_o, input_S)  # Shape: (B, num_heads, num_nodes, k)
         # compute graph connectivity mask S based on updated W by percentile thresholding
-        threshold = torch.clamp(torch.quantile(W.view(-1), 0.05, keepdim=True), min=default_threshold)  # 5th percentile threshold for sparsity
+        threshold = torch.clamp(
+            torch.quantile(W.flatten(2), 0.05, dim=-1, keepdim=True),
+            min=default_threshold,
+        ).unsqueeze(-1)  # 5th percentile threshold per (B, head)
 
         W_new = torch.clamp(W, min=0)  # Ensure non-negativity
         W_new = torch.where(W < threshold, torch.zeros_like(W), W)  # Zero out weights below the threshold
@@ -253,8 +314,9 @@ def _make_grid_signal(grid_size=7):
 
 
 def _cg_with_residual_trace(block, y, W, S):
-    if y.ndim == 2:
-        y = y.unsqueeze(1).repeat(1, block.num_heads, 1)
+    y = block._ensure_signal_shape(y)
+    W = block._ensure_graph_shape(W, y.size(0), "W")
+    S = block._ensure_graph_shape(S, y.size(0), "S")
 
     def lhs(z):
         return z + block.mu * block.apply_L(z, W, S)
@@ -269,8 +331,8 @@ def _cg_with_residual_trace(block, y, W, S):
         zip(block.CG_solver.alpha, block.CG_solver.beta),
         start=1,
     ):
-        alpha = alpha.view(1, -1, 1)
-        beta = beta.view(1, -1, 1)
+        alpha = alpha.view(1, 1, -1, 1)
+        beta = beta.view(1, 1, -1, 1)
         A_direction = lhs(direction)
         x = x + alpha * direction
         residual = residual - alpha * A_direction
@@ -314,27 +376,28 @@ def _print_node_degree_changes(prefix, previous_W, previous_S, current_W, curren
     )
 
     print(f"{prefix} node degree changes:")
-    for head_idx in range(current_S.size(0)):
-        head_topo_delta = topo_delta[head_idx]
-        head_weighted_delta = weighted_delta[head_idx]
-        print(
-            f"  head {head_idx}: "
-            f"topo_delta min={int(head_topo_delta.min().item())}, "
-            f"mean={head_topo_delta.float().mean().item():.2f}, "
-            f"max={int(head_topo_delta.max().item())}; "
-            f"weighted_delta min={head_weighted_delta.min().item():.6f}, "
-            f"mean={head_weighted_delta.mean().item():.6f}, "
-            f"max={head_weighted_delta.max().item():.6f}"
-        )
+    for batch_idx in range(current_S.size(0)):
+        for head_idx in range(current_S.size(1)):
+            head_topo_delta = topo_delta[batch_idx, head_idx]
+            head_weighted_delta = weighted_delta[batch_idx, head_idx]
+            print(
+                f"  batch {batch_idx}, head {head_idx}: "
+                f"topo_delta min={int(head_topo_delta.min().item())}, "
+                f"mean={head_topo_delta.float().mean().item():.2f}, "
+                f"max={int(head_topo_delta.max().item())}; "
+                f"weighted_delta min={head_weighted_delta.min().item():.6f}, "
+                f"mean={head_weighted_delta.mean().item():.6f}, "
+                f"max={head_weighted_delta.max().item():.6f}"
+            )
 
-        if grid_size is not None and grid_size * grid_size == head_topo_delta.numel():
-            print("  topo_delta grid:")
-            print(head_topo_delta.reshape(grid_size, grid_size))
-            print("  weighted_delta grid:")
-            print(head_weighted_delta.reshape(grid_size, grid_size))
-        else:
-            print("  topo_delta per node:", head_topo_delta)
-            print("  weighted_delta per node:", head_weighted_delta)
+            if grid_size is not None and grid_size * grid_size == head_topo_delta.numel():
+                print("  topo_delta grid:")
+                print(head_topo_delta.reshape(grid_size, grid_size))
+                print("  weighted_delta grid:")
+                print(head_weighted_delta.reshape(grid_size, grid_size))
+            else:
+                print("  topo_delta per node:", head_topo_delta)
+                print("  weighted_delta per node:", head_weighted_delta)
 
 
 def _m_step_with_weight_trace(block, x, W, S, default_threshold=1e-4):
@@ -348,8 +411,8 @@ def _m_step_with_weight_trace(block, x, W, S, default_threshold=1e-4):
         if W[~candidate_mask].abs().sum() != 0:
             raise ValueError("W has non-zero entries outside the candidate mask.")
 
-        resistance = block.ER_solver(W, neighbor_mask)
-        sparse_penalty = block.gamma_list[idx] * (W + block.xi)
+        resistance = block._er_solver(W, neighbor_mask)
+        sparse_penalty = block.gamma_list[idx] / (W + block.xi)
         grad = x_diff_square + sparse_penalty - resistance
         grad = grad * neighbor_mask.to(dtype=grad.dtype, device=grad.device)
         W = torch.clamp(W - block.step_size_list[idx] * grad, min=0)
@@ -357,9 +420,9 @@ def _m_step_with_weight_trace(block, x, W, S, default_threshold=1e-4):
         neighbor_mask = (W > 0) & candidate_mask
 
         threshold = torch.clamp(
-            torch.quantile(W.view(-1), 0.05, keepdim=True),
+            torch.quantile(W.flatten(2), 0.05, dim=-1, keepdim=True),
             min=default_threshold,
-        )
+        ).unsqueeze(-1)
         W_sparse = torch.where(W < threshold, torch.zeros_like(W), W)
         S_sparse = W_sparse > 0
         _summarize_weights(f"  iter {idx + 1:02d}", W_sparse, S_sparse)
@@ -371,13 +434,25 @@ def _demo_grid_forward() -> None:
     torch.manual_seed(7)
 
     grid_size = 10
+    batch_size = 2
+    num_data = 3
     num_heads = 1
     num_nodes = grid_size * grid_size
     neighbor_list, input_S = _build_grid_window_neighbors(grid_size, window_size=5)
 
-    clean_signal = _make_grid_signal(grid_size)
+    clean_signal = _make_grid_signal(grid_size).view(1, 1, -1).expand(
+        batch_size,
+        num_data,
+        -1,
+    )
     noisy_signal = clean_signal + 0.25 * torch.randn_like(clean_signal)
 
+    input_S = input_S.repeat(num_heads, 1, 1).unsqueeze(0).expand(
+        batch_size,
+        -1,
+        -1,
+        -1,
+    )
     W_o = input_S.float()
     block = UnrolledGEMBlock(
         num_nodes,
@@ -395,6 +470,8 @@ def _demo_grid_forward() -> None:
     )
 
     print("10x10 grid GEM block demo")
+    print("batch size:", batch_size)
+    print("n_data:", num_data)
     print("neighbor_list shape:", tuple(neighbor_list.shape))
     print("input_S shape:", tuple(input_S.shape))
     print("initial undirected edges:", int(input_S.sum().item() // 2))
