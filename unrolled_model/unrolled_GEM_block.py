@@ -435,7 +435,7 @@ def _demo_grid_forward() -> None:
 
     grid_size = 10
     batch_size = 2
-    num_data = 3
+    num_data = 2 * grid_size * grid_size
     num_heads = 1
     num_nodes = grid_size * grid_size
     neighbor_list, input_S = _build_grid_window_neighbors(grid_size, window_size=5)

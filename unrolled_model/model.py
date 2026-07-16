@@ -624,7 +624,7 @@ def _demo_block_sparsity(device_name="cuda:0") -> None:
 
     grid_size = 10
     batch_size = 4
-    num_data = 3
+    num_data = 2 * grid_size * grid_size
     num_heads = 2
     num_blocks = 4
     num_nodes = grid_size * grid_size
