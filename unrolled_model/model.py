@@ -139,6 +139,35 @@ def _summarize_block_sparsity(prefix, initial_S, previous_S, current_S):
         )
 
 
+def _infer_square_grid_size(num_nodes):
+    grid_size = int(num_nodes ** 0.5)
+    if grid_size * grid_size == num_nodes:
+        return grid_size
+    return None
+
+
+def _print_node_degree_changes(prefix, previous_S, current_S, grid_size=None):
+    current_degree = current_S.bool().sum(dim=-1).detach().cpu()
+    previous_degree = previous_S.bool().sum(dim=-1).detach().cpu()
+    degree_delta = current_degree - previous_degree
+
+    print(f"{prefix} node topo degree changes:")
+    for head_idx in range(degree_delta.size(0)):
+        head_delta = degree_delta[head_idx]
+        print(
+            f"  head {head_idx}: "
+            f"delta min={int(head_delta.min().item())}, "
+            f"mean={head_delta.float().mean().item():.2f}, "
+            f"max={int(head_delta.max().item())}"
+        )
+
+        if grid_size is not None and grid_size * grid_size == head_delta.numel():
+            print("  degree delta grid:")
+            print(head_delta.reshape(grid_size, grid_size))
+        else:
+            print("  degree delta per node:", head_delta)
+
+
 def _format_flops(flops):
     if flops >= 1e12:
         return f"{flops / 1e12:.3f} TFLOPs"
@@ -166,13 +195,28 @@ def _sync_demo_device(device):
         torch.cuda.synchronize(device)
 
 
-def _profile_one_backward_step(model, noisy_signal, W_o, device):
-    activities = [torch.profiler.ProfilerActivity.CPU]
+def _reset_demo_peak_memory(device):
     if device.type == "cuda":
-        activities.append(torch.profiler.ProfilerActivity.CUDA)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
+
+
+def _read_demo_peak_memory(device):
+    if device.type != "cuda":
+        return None, None
+    torch.cuda.synchronize(device)
+    peak_allocated_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+    peak_reserved_mb = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+    return peak_allocated_mb, peak_reserved_mb
+
+
+def _profile_one_backward_step(model, noisy_signal, W_o, device, reset_peak=True):
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if device.type == "cuda":
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+        if reset_peak:
+            _reset_demo_peak_memory(device)
 
     model.train()
     model.zero_grad(set_to_none=True)
@@ -197,13 +241,7 @@ def _profile_one_backward_step(model, noisy_signal, W_o, device):
         _sync_demo_device(device)
         backward_seconds = time.perf_counter() - backward_start
 
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-        peak_allocated_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-        peak_reserved_mb = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
-    else:
-        peak_allocated_mb = None
-        peak_reserved_mb = None
+    peak_allocated_mb, peak_reserved_mb = _read_demo_peak_memory(device)
 
     total_flops = sum(
         event.flops for event in prof.key_averages() if event.flops is not None
@@ -240,7 +278,7 @@ def _build_demo_model(
         num_blocks,
         E_iters=6,
         M_iters=10,
-        GD_step_init=0.1,
+        GD_step_init=0.2,
         mu_init=0.2,
         gamma_init=0.4,
         c=20,
@@ -263,7 +301,7 @@ def _print_profile_stats(profile_stats, device):
         "  forward + backward time:",
         f"{profile_stats['forward_backward_seconds']:.6f} s",
     )
-    if device.type == "cuda":
+    if device.type == "cuda" and "full_run_seconds" not in profile_stats:
         print(
             "  peak GPU memory allocated:",
             f"{profile_stats['peak_allocated_mb']:.2f} MiB",
@@ -278,105 +316,22 @@ def _print_profile_stats(profile_stats, device):
     )
 
 
-def _profile_demo_backends(
-    backends,
-    reference_state,
-    num_nodes,
-    neighbor_list,
-    input_S,
-    num_heads,
-    num_blocks,
-    noisy_signal,
-    W_o,
-    device,
-):
-    stats_by_backend = []
-    for er_backend in backends:
-        model = _build_demo_model(
-            num_nodes,
-            neighbor_list,
-            input_S,
-            num_heads,
-            num_blocks,
-            er_backend,
-        ).to(device)
-        missing, unexpected = model.load_state_dict(reference_state, strict=False)
-        unexpected = [
-            key for key in unexpected
-            if not key.startswith("GEM_block_list.") or ".ER_solver." not in key
-        ]
-        if unexpected:
-            raise RuntimeError(
-                f"Unexpected state_dict keys for {er_backend}: {unexpected}"
-            )
-        model.to(device)
-        profile_stats = _profile_one_backward_step(model, noisy_signal, W_o, device)
-        stats_by_backend.append(profile_stats)
-        _print_profile_stats(profile_stats, device)
-        print()
-        del model
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-    return stats_by_backend
+def _load_reference_state(model, reference_state, er_backend):
+    missing, unexpected = model.load_state_dict(reference_state, strict=False)
+    unexpected = [
+        key for key in unexpected
+        if not key.startswith("GEM_block_list.") or ".ER_solver." not in key
+    ]
+    if unexpected:
+        raise RuntimeError(
+            f"Unexpected state_dict keys for {er_backend}: {unexpected}"
+        )
+    return missing
 
 
-def _print_backend_comparison(stats_by_backend, device):
-    if len(stats_by_backend) < 2:
-        return
-    print("ER backend comparison:")
-    for stats in stats_by_backend:
-        parts = [
-            f"{stats['er_backend']}:",
-            f"forward={stats['forward_seconds']:.6f}s",
-            f"backward={stats['backward_seconds']:.6f}s",
-            f"total={stats['forward_backward_seconds']:.6f}s",
-        ]
-        if device.type == "cuda":
-            parts.append(f"peak_alloc={stats['peak_allocated_mb']:.2f}MiB")
-            parts.append(f"peak_reserved={stats['peak_reserved_mb']:.2f}MiB")
-        print("  " + ", ".join(parts))
-
-
-def _demo_block_sparsity(device_name="cuda:0") -> None:
-    torch.manual_seed(7)
-    device = _resolve_demo_device(device_name)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(7)
-
-    grid_size = 20
-    batch_size = 2
-    num_heads = 1
-    num_blocks = 4
-    num_nodes = grid_size * grid_size
-    neighbor_list, input_S = _build_grid_window_neighbors(grid_size, window_size=5)
-    neighbor_list = neighbor_list.to(device)
-    input_S = input_S.to(device)
-
-    clean_signal = _make_grid_signal(grid_size).to(device).repeat(batch_size, 1)
-    noisy_signal = clean_signal + 0.25 * torch.randn_like(clean_signal)
-    W_o = input_S.float()
-
-    model = _build_demo_model(
-        num_nodes,
-        neighbor_list,
-        input_S,
-        num_heads,
-        num_blocks,
-        er_backend="sksparse",
-    ).to(device)
-    reference_state = {
-        key: value.detach().cpu().clone()
-        for key, value in model.state_dict().items()
-    }
-
-    print(f"{grid_size}x{grid_size} grid UnrolledGEM sparsity demo")
-    print("device:", device)
-    print("batch size:", batch_size)
-    print("neighbor_list shape:", tuple(neighbor_list.shape))
-    print("input_S shape:", tuple(input_S.shape))
-    print("clean signal shape:", tuple(clean_signal.shape))
-    print("noisy signal shape:", tuple(noisy_signal.shape))
+def _run_sparsity_trace(model, noisy_signal):
+    model.train()
+    grid_size = _infer_square_grid_size(model.num_nodes)
     _summarize_block_sparsity(
         "input candidate graph:",
         model.input_S,
@@ -409,15 +364,262 @@ def _demo_block_sparsity(device_name="cuda:0") -> None:
                 previous_S,
                 S,
             )
+            _print_node_degree_changes(
+                f"after block {block_idx + 1:02d}:",
+                previous_S,
+                S,
+                grid_size=grid_size,
+            )
             W_old = W
 
+    return x, W, S
+
+
+def _print_trace_outputs(x, W, S):
+    active = S.bool()
+    print("trace final outputs:")
+    print("  x:", tuple(x.shape))
+    print("  W:", tuple(W.shape))
+    print("  S:", tuple(S.shape))
+    print("  x mean/std:", f"{x.mean().item():.6f}/{x.std().item():.6f}")
+    if active.any():
+        values = W[active]
+        print(
+            "  active W min/mean/max:",
+            f"{values.min().item():.6f}/"
+            f"{values.mean().item():.6f}/"
+            f"{values.max().item():.6f}",
+        )
+    else:
+        print("  active W min/mean/max: no active edges")
+
+
+def _build_loaded_demo_model(
+    er_backend,
+    reference_state,
+    num_nodes,
+    neighbor_list,
+    input_S,
+    num_heads,
+    num_blocks,
+    device,
+):
+    model = _build_demo_model(
+        num_nodes,
+        neighbor_list,
+        input_S,
+        num_heads,
+        num_blocks,
+        er_backend,
+    ).to(device)
+    _load_reference_state(model, reference_state, er_backend)
+    return model.to(device)
+
+
+def _run_backend_trace(
+    er_backend,
+    reference_state,
+    num_nodes,
+    neighbor_list,
+    input_S,
+    num_heads,
+    num_blocks,
+    noisy_signal,
+    device,
+):
+    print(f"sparsity trace with ER backend: {er_backend}")
+    model = _build_loaded_demo_model(
+        er_backend,
+        reference_state,
+        num_nodes,
+        neighbor_list,
+        input_S,
+        num_heads,
+        num_blocks,
+        device,
+    )
+    x, W, S = _run_sparsity_trace(model, noisy_signal)
+    _print_trace_outputs(x, W, S)
+    print()
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+
+def _run_trace_backends(
+    backends,
+    reference_state,
+    num_nodes,
+    neighbor_list,
+    input_S,
+    num_heads,
+    num_blocks,
+    noisy_signal,
+    device,
+):
+    print("Sparsity traces:")
+    for er_backend in backends:
+        _run_backend_trace(
+            er_backend,
+            reference_state,
+            num_nodes,
+            neighbor_list,
+            input_S,
+            num_heads,
+            num_blocks,
+            noisy_signal,
+            device,
+        )
+
+
+def _run_training_profile_backend(
+    er_backend,
+    reference_state,
+    num_nodes,
+    neighbor_list,
+    input_S,
+    num_heads,
+    num_blocks,
+    noisy_signal,
+    W_o,
+    device,
+):
+    print(f"training profile with ER backend: {er_backend}")
+    model = _build_loaded_demo_model(
+        er_backend,
+        reference_state,
+        num_nodes,
+        neighbor_list,
+        input_S,
+        num_heads,
+        num_blocks,
+        device,
+    )
+    _reset_demo_peak_memory(device)
+    profile_stats = _profile_one_backward_step(
+        model,
+        noisy_signal,
+        W_o,
+        device,
+        reset_peak=False,
+    )
+    _print_profile_stats(profile_stats, device)
     print()
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return profile_stats
+
+
+def _profile_demo_backends(
+    backends,
+    reference_state,
+    num_nodes,
+    neighbor_list,
+    input_S,
+    num_heads,
+    num_blocks,
+    noisy_signal,
+    W_o,
+    device,
+):
+    stats_by_backend = []
+    for er_backend in backends:
+        stats_by_backend.append(
+            _run_training_profile_backend(
+                er_backend,
+                reference_state,
+                num_nodes,
+                neighbor_list,
+                input_S,
+                num_heads,
+                num_blocks,
+                noisy_signal,
+                W_o,
+                device,
+            )
+        )
+
+    return stats_by_backend
+
+
+def _print_backend_comparison(stats_by_backend, device):
+    if len(stats_by_backend) < 2:
+        return
+    print("ER backend comparison:")
+    for stats in stats_by_backend:
+        parts = [
+            f"{stats['er_backend']}:",
+            f"forward={stats['forward_seconds']:.6f}s",
+            f"backward={stats['backward_seconds']:.6f}s",
+            f"fwd_bwd={stats['forward_backward_seconds']:.6f}s",
+        ]
+        if device.type == "cuda":
+            parts.append(f"peak_alloc={stats['peak_allocated_mb']:.2f}MiB")
+            parts.append(f"peak_reserved={stats['peak_reserved_mb']:.2f}MiB")
+        print("  " + ", ".join(parts))
+
+
+def _demo_block_sparsity(device_name="cuda:0") -> None:
+    torch.manual_seed(7)
+    device = _resolve_demo_device(device_name)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(7)
+
+    grid_size = 10
+    batch_size = 4
+    num_heads = 2
+    num_blocks = 4
+    num_nodes = grid_size * grid_size
+    neighbor_list, input_S = _build_grid_window_neighbors(grid_size, window_size=5)
+    neighbor_list = neighbor_list.to(device)
+    input_S = input_S.to(device)
+
+    clean_signal = _make_grid_signal(grid_size).to(device).repeat(batch_size, 1)
+    noisy_signal = clean_signal + 0.25 * torch.randn_like(clean_signal)
+    W_o = input_S.float()
+
+    model = _build_demo_model(
+        num_nodes,
+        neighbor_list,
+        input_S,
+        num_heads,
+        num_blocks,
+        er_backend="sksparse",
+    ).to(device)
+    reference_state = {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+
+    print(f"{grid_size}x{grid_size} grid UnrolledGEM sparsity demo")
+    print("device:", device)
+    print("batch size:", batch_size)
+    print("neighbor_list shape:", tuple(neighbor_list.shape))
+    print("input_S shape:", tuple(input_S.shape))
+    print("clean signal shape:", tuple(clean_signal.shape))
+    print("noisy signal shape:", tuple(noisy_signal.shape))
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    backends = ("torch_dense", "sksparse")
+    print()
+    _run_trace_backends(
+        backends,
+        reference_state,
+        num_nodes,
+        neighbor_list,
+        input_S,
+        num_heads,
+        num_blocks,
+        noisy_signal,
+        device,
+    )
+
+    print("Training forward/backward profiles from fresh models:")
     stats_by_backend = _profile_demo_backends(
-        ("sksparse", "torch_dense"),
+        backends,
         reference_state,
         num_nodes,
         neighbor_list,

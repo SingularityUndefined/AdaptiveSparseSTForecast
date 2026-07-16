@@ -173,7 +173,7 @@ class UnrolledGEMBlock(nn.Module):
             resistance = self.ER_solver(W, neighbor_mask)  # Shape: (num_heads, num_nodes, k)
             
             # TODO: check which epsilon to be used here, the one in ER_solver or the one in M_step
-            sparse_penalty = self.gamma_list[i] * (W + self.xi)  # Shape: (num_heads, num_nodes, k)
+            sparse_penalty = self.gamma_list[i] / (W + self.xi)  # Shape: (num_heads, num_nodes, k)
             grad = x_diff_square + sparse_penalty - resistance  # Shape: (num_heads, num_nodes, k)
             grad = grad * neighbor_mask.to(dtype=grad.dtype, device=grad.device)  # Apply neighbor mask to gradient
 
@@ -297,6 +297,46 @@ def _summarize_weights(prefix, W, S):
     )
 
 
+def _print_node_degree_changes(prefix, previous_W, previous_S, current_W, current_S, grid_size=None):
+    previous_topo_degree = previous_S.bool().sum(dim=-1)
+    current_topo_degree = current_S.bool().sum(dim=-1)
+    previous_weighted_degree = (
+        previous_W * previous_S.to(dtype=previous_W.dtype, device=previous_W.device)
+    ).sum(dim=-1)
+    current_weighted_degree = (
+        current_W * current_S.to(dtype=current_W.dtype, device=current_W.device)
+    ).sum(dim=-1)
+
+    topo_delta = current_topo_degree - previous_topo_degree
+    weighted_delta = current_weighted_degree - previous_weighted_degree.to(
+        dtype=current_weighted_degree.dtype,
+        device=current_weighted_degree.device,
+    )
+
+    print(f"{prefix} node degree changes:")
+    for head_idx in range(current_S.size(0)):
+        head_topo_delta = topo_delta[head_idx]
+        head_weighted_delta = weighted_delta[head_idx]
+        print(
+            f"  head {head_idx}: "
+            f"topo_delta min={int(head_topo_delta.min().item())}, "
+            f"mean={head_topo_delta.float().mean().item():.2f}, "
+            f"max={int(head_topo_delta.max().item())}; "
+            f"weighted_delta min={head_weighted_delta.min().item():.6f}, "
+            f"mean={head_weighted_delta.mean().item():.6f}, "
+            f"max={head_weighted_delta.max().item():.6f}"
+        )
+
+        if grid_size is not None and grid_size * grid_size == head_topo_delta.numel():
+            print("  topo_delta grid:")
+            print(head_topo_delta.reshape(grid_size, grid_size))
+            print("  weighted_delta grid:")
+            print(head_weighted_delta.reshape(grid_size, grid_size))
+        else:
+            print("  topo_delta per node:", head_topo_delta)
+            print("  weighted_delta per node:", head_weighted_delta)
+
+
 def _m_step_with_weight_trace(block, x, W, S, default_threshold=1e-4):
     candidate_mask = S.bool()
     neighbor_mask = candidate_mask
@@ -330,7 +370,7 @@ def _m_step_with_weight_trace(block, x, W, S, default_threshold=1e-4):
 def _demo_grid_forward() -> None:
     torch.manual_seed(7)
 
-    grid_size = 7
+    grid_size = 10
     num_heads = 1
     num_nodes = grid_size * grid_size
     neighbor_list, input_S = _build_grid_window_neighbors(grid_size, window_size=5)
@@ -345,7 +385,7 @@ def _demo_grid_forward() -> None:
         num_heads,
         E_iters=6,
         M_iters=10,
-        GD_step_init=0.1,
+        GD_step_init=0.2,
         mu_init=0.2,
         gamma_init=0.4,
         c=20,
@@ -354,7 +394,7 @@ def _demo_grid_forward() -> None:
         xi=1.0,
     )
 
-    print("7x7 grid GEM block demo")
+    print("10x10 grid GEM block demo")
     print("neighbor_list shape:", tuple(neighbor_list.shape))
     print("input_S shape:", tuple(input_S.shape))
     print("initial undirected edges:", int(input_S.sum().item() // 2))
@@ -371,6 +411,14 @@ def _demo_grid_forward() -> None:
     print("  W_new:", tuple(W_new.shape))
     print("  S_new:", tuple(S_new.shape))
     print("final undirected edges from S:", int(S_new.sum().item() // 2))
+    _print_node_degree_changes(
+        "final vs initial",
+        W_o,
+        input_S,
+        W_new,
+        S_new,
+        grid_size=grid_size,
+    )
 
 
 if __name__ == "__main__":
